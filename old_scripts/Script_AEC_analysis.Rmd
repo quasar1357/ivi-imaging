@@ -1,0 +1,633 @@
+---
+title: "Species_quantification"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Loading packages
+
+```{r setup}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(ggstatsplot)
+library(multimode)
+library(grid)
+library(ggpubr)
+library("Rcpp")
+library("readxl")
+library(rstatix) 
+library(ggprism)
+library(patchwork)
+library(emmeans)
+library(magrittr)
+```
+
+## set directory (home/office) and upload files
+## Create the environment and directories
+```{r}
+#Set working dir location location 
+print("Main Folder")
+(WD <- dirname(rstudioapi::getSourceEditorContext()$path)) 
+if (!is.null(WD)) setwd(WD) 
+
+#Folder to export results data to
+species=basename(WD) ## This has to be adjusted for each Species
+figDir="Figures"
+dataDir="Data"
+
+#Check if folder exist, if else make it
+## Figure Directory
+print("Figure Directory exist")
+ifelse(!dir.exists(file.path(WD, figDir)), 
+       dir.create(file.path(WD, figDir)), T)
+print("Data Directory exist")
+ifelse(!dir.exists(file.path(WD, dataDir)), 
+       dir.create(file.path(WD, dataDir)), T)
+
+
+cilia_H <- read.delim("results_cilia_H.txt", sep="", header=T,
+                      dec = ",")
+
+GFP_Human <- read.delim("results_infection_H.txt", sep="", header=T,
+                        dec = ",")
+
+cilia_P <- read.delim("results_cilia_P.txt", sep="", header=T,
+                      dec = ",")
+
+GFP_Porcine <- read.delim("results_infection_P.txt", sep="", header=T,
+                        dec = ",")
+
+cilia_B <- read.delim("results_cilia_bovine_corrected.txt", sep="", header=T,
+                      dec = ",")
+
+GFP_Bovine <- read.delim("results_infection_bovine_corrected.txt", sep="", header=T,
+                        dec = ",")
+
+
+```
+
+## put Cy5 and GFP tables together
+
+```{r}
+#for Human
+colnames(GFP_Human)[4] <- c("GFP_mean_intensity")
+colnames(cilia_H)[4] <- c("Cy5_mean_intensity")
+
+Human <- cbind.data.frame(cilia_H, GFP_Human[4])
+
+#for pig
+colnames(GFP_Porcine)[4] <- c("GFP_mean_intensity")
+colnames(cilia_P)[4] <- c("Cy5_mean_intensity")
+
+Porcine <- cbind.data.frame(cilia_P, GFP_Porcine[4])
+
+#for bovine
+
+colnames(GFP_Bovine)[4] <- c("GFP_mean_intensity")
+colnames(cilia_B)[4] <- c("Cy5_mean_intensity")
+
+Bovine <- cbind.data.frame(cilia_B, GFP_Bovine[4])
+```
+
+## Relabel bovine table to fit Human and porcine ones
+
+```{r}
+colnames(Bovine)[which(names(Bovine) == "replicate")] <- "donor"
+
+colnames(Bovine)[which(names(Bovine) == "experiment")] <- "infection"
+
+Bovine <- Bovine %>% 
+  relocate(channel, .after = image)
+```
+
+## combine all species info in one single table
+```{r}
+Species <- rbind(Human, Porcine, Bovine)
+
+Species$Cy5_mean_intensity <- as.numeric(Species$Cy5_mean_intensity)
+Species$GFP_mean_intensity <- as.numeric(Species$GFP_mean_intensity)
+
+#set area,  cy5 and GFP values to log10
+Species <- Species %>%
+  dplyr::mutate(area = log10(area), Cy5_mean_intensity = log10(Cy5_mean_intensity), 
+         GFP_mean_intensity = log10(GFP_mean_intensity))
+```
+
+#clean data from too small cells
+
+```{r}
+Quantile <- Species %>%
+  group_by(species) %>%
+  summarise(quantile = quantile(area, probs=c(.25, .75), na.rm = FALSE), IQR = IQR(area))
+
+Species_filtered <- Species %>%
+  group_by(species) %>%
+  subset(area > ((Quantile$quantile - 1.5*Quantile$IQR) & area < (Quantile$quantile + 1.5*Quantile$IQR)))
+
+#table(Species$species)
+#table(Species_filtered$species)
+```
+#create a new column for infected/non-infected cells: 1=infected, 0=un-infected
+```{r}
+
+Mock_GFP <- Species_filtered %>%
+  group_by(species, donor, temperature, virus) %>%
+  subset(infection == c("MC", "MD")) %>%
+  summarise(mean_GFP = mean(GFP_mean_intensity), sd_GFP = sd(GFP_mean_intensity), mean_sd = (mean_GFP + 3*sd_GFP))
+
+Species_GFP <- Species_filtered %>%
+    left_join(Mock_GFP) %>% 
+    mutate(Cy5_mean_intensity=Cy5_mean_intensity, GFP_mean_intensity=GFP_mean_intensity,
+                  infected_cell = ifelse(GFP_mean_intensity > mean_sd, 1, 0))
+
+Human <- subset(Species_GFP, species==c("H")) 
+
+Porcine <- subset(Species_GFP, species ==c("P"))
+
+Bovine <- subset(Species_GFP, species ==c("B"))
+
+
+Species = rbind(Human, Porcine, Bovine)
+
+```
+
+#ciliated vs non ciliated
+```{r, warning=FALSE}
+
+Species$Cy5_mean_intensity <- as.numeric(Species$Cy5_mean_intensity)
+Species$GFP_mean_intensity <- as.numeric(Species$GFP_mean_intensity)
+
+df <- subset(Species, select = -c( perimeter, feret_diameter_max : file, channel, mean_GFP:mean_sd))
+
+df <- df %>%
+  group_by(species, donor, temperature, virus, infection, image) %>%
+  mutate(cilia = Cy5_mean_intensity)
+
+
+#find range non-ciliated vs ciliated (using multimode package)
+
+df <- df %>%
+  group_by(species, donor, temperature, virus, infection, image) %>%
+  mutate(loc = (locmodes(cilia, mod0 = 2, display = FALSE))$locations[2]) 
+
+Species <- df %>%
+  group_by(species, donor, temperature, virus, infection, image, loc, min)%>%
+  mutate(ciliated_cell = ifelse(cilia > loc , 1, 0))
+
+
+```
+
+#percentage of ciliated cells in mock samples
+```{r}
+Mock_samples <- subset(Species, infection==c("MC", "MD")) %>%
+  group_by(species, donor) %>%
+  summarise(cells = length(label))
+
+Mock_ciliated_samples <- subset(Species, infection==c("MC", "MD")) %>%
+  subset(ciliated_cell==c("1")) %>%
+  group_by(species, donor) %>%
+  summarise(cilia=length(label))
+
+ciliated_ratio <- Mock_ciliated_samples %>%
+  left_join(Mock_samples)%>%
+  group_by(species, donor)%>%
+    summarise(ratio = cilia/cells)
+
+ciliated_mean <- ciliated_ratio %>%
+  group_by(species)%>%
+    summarise(ratio, mean_cilia = mean(ratio), sem=sd(ratio)/sqrt(length(ratio)), 
+            ymin_sem = mean_cilia-sem,
+            ymax_sem = mean_cilia+sem,
+            sd=sd(ratio), 
+            ymin_sd=mean_cilia-sd, ymax_sd=mean_cilia+sd)
+
+
+# New facet label names for species
+species.labs <- c("Human", "Porcine", "Bovine")
+names(species.labs) <- c("H", "P", "B")
+
+
+mock_cilia_percentage <- ggplot(ciliated_mean, aes(x=species, y=mean_cilia), labeller=species.labs)+
+  geom_bar(stat = "identity", colour = "black", size=0.7, fill='#d73027')+
+  geom_errorbar(aes(ymin=ymin_sd, ymax=ymax_sd), size=0.7, width = 0.4)+ 
+  theme_bw()+
+  scale_x_discrete(limits = c("H", "P", "B"),
+                   labels = c("Human", "Porcine", "Bovine"))+
+  scale_y_continuous(limits =c(0,1), labels = scales::percent_format(accuracy = 1))+
+  xlab("Temperature")+
+  ylab("Percentage of ciliated cells")+
+  theme(axis.title.x = element_text(size=28))+
+  theme(axis.title.y = element_text(size=28))+
+  theme(axis.text.x = element_text(size=26))+
+  theme(axis.text.y = element_text(size=26))
+
+mock_cilia_percentage
+
+
+```
+
+#check for significance:
+
+```{r}
+ciliated_mean$species <- as.factor(ciliated_mean$species)
+ciliated_mean$ratio <- as.numeric(ciliated_mean$ratio)
+
+ciliated_ratio <- ciliated_ratio %>%
+  ungroup()
+
+#normality test
+qqPlot(ciliated_ratio$ratio)
+shapiro.test(ciliated_ratio$ratio)
+
+#t.test
+pwc1 <- ciliated_ratio %>%
+  pairwise_t_test(ratio ~ species, paired = T) %>%
+  add_significance() %>%
+  add_xy_position(x="species", dodge = 0.9)
+
+pwc1
+
+mock_cilia_percentage_sign <- ggplot(ciliated_mean, aes(x=species, y=ratio), labeller=species.labs)+
+  geom_bar(stat = "summary",  colour = "black", size=0.7, fill='#d73027')+
+  geom_errorbar(aes(ymin=ymin_sd, ymax=ymax_sd), size=0.7, width = 0.4)+ 
+  theme_bw()+
+  scale_x_discrete(limits = c("H", "P", "B"),
+                   labels = c("Human", "Porcine", "Bovine"))+
+  stat_pvalue_manual(pwc1, size = 10, hide.ns = F,bracket.nudge.y = 0.1, step.increase=0.08) +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits =c(0,1.2), labels = scales::percent_format(accuracy = 1))+
+  xlab("Temperature")+
+  ylab("Percentage of ciliated cells")+
+  theme(axis.title.x = element_text(size=37))+
+  theme(axis.title.y = element_text(size=37))+
+  theme(axis.text.x = element_text(size=32))+
+  theme(axis.text.y = element_text(size=32))
+
+mock_cilia_percentage_sign
+
+ 
+```
+
+
+
+# cell count
+
+```{r}
+Species_IS <- subset(Species, infection==c("C", "D")) 
+
+Species_IS$image <- as.numeric(Species_IS$image)
+
+#cell count per donor and per image (infected and non infected)
+df <- Species_IS %>%
+  group_by(species, temperature, virus, donor, infected_cell, image) %>%
+  summarise(cell_image = mean((length(label))))%>%
+  ungroup %>%
+  complete(nesting(species, temperature, virus, donor, infected_cell, image),
+           fill = list(cell_image = 0))
+
+
+#cell count per donor (infected and non infected)
+
+df2 <- df%>%
+  group_by(species, temperature, virus, donor, infected_cell) %>%
+  summarise(cell_count_donor = mean(cell_image)) %>%
+  ungroup %>%
+  complete(nesting(species, temperature, virus, donor),
+           nesting(infected_cell),
+           fill = list(cell_count_donor = 0))
+
+#mean cell count (infected and non infected)
+
+all_cells <- df2%>%
+  group_by(species, temperature, virus, infected_cell) %>%
+  summarise(cell_count_mean = mean(cell_count_donor), sd=sd(cell_count_donor), 
+            sem=sd(cell_count_donor)/sqrt(length(cell_count_donor)), 
+            ymin_sd = cell_count_mean-sd,
+            ymax_sd = cell_count_mean+sd,
+            ymin_sem = cell_count_mean - sem,
+            ymax_sem = cell_count_mean + sem) %>%
+  ungroup %>%
+  complete(nesting(species, temperature, virus),
+           nesting(infected_cell),
+           fill = list(cell_count_mean = 0))
+
+  
+all_cells$species <- factor(all_cells$species, levels = c("H", "P", "B"))
+
+all_cells$species <- as.factor(all_cells$species)
+all_cells$infected_cell <- as.factor(all_cells$infected_cell)
+all_cells$virus <- as.factor(all_cells$virus)
+all_cells$temperature <- as.factor(all_cells$temperature)
+
+all_cells$cell_count_mean <- as.numeric(all_cells$cell_count_mean)
+all_cells$sd <- as.numeric(all_cells$sd)
+all_cells$sem <- as.numeric(all_cells$sem)
+all_cells$ymin_sd <- as.numeric(all_cells$ymin_sd)
+all_cells$ymax_sd <- as.numeric(all_cells$ymax_sd)
+all_cells$ymin_sem <- as.numeric(all_cells$ymin_sem)
+all_cells$ymax_sem <- as.numeric(all_cells$ymax_sem)
+all_cells$temperature <- paste0(all_cells$temperature, "°C") #adding Temperature symbol to variable
+
+
+# New facet label names for species
+species.labs <- c("Human", "Porcine", "Bovine")
+names(species.labs) <- c("H", "P", "B")
+
+
+#as dodge plot
+ggplot(all_cells, aes(x=temperature, y=cell_count_mean, fill=infected_cell))+
+  facet_wrap(species~virus, scales = "free", ncol=2, nrow=3, labeller = labeller(species = species.labs))+
+  geom_bar(position = "dodge",  stat = "identity", colour = "black", size=0.2)+
+  geom_errorbar(aes(ymin = ymin_sd,
+                    ymax = ymax_sd), width=0.2, position=position_dodge(width = 0.9), stat = "identity", size=0.2)+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-infected cells", "Infected cells"))+
+  ylab("Mean cell count")+
+  labs(title = "Total cell count")+
+  ggeasy::easy_center_title()
+
+Species_ICV <- subset(all_cells, virus==c("ICV")) 
+
+total_cell_count_ICV <- ggplot(Species_ICV, aes(x=temperature, y=cell_count_mean, fill=infected_cell))+
+  facet_wrap(~species, scales = "free", ncol=3, nrow=1, labeller = labeller(species = species.labs))+
+  geom_bar(position = "dodge",  stat = "identity", colour = "black", size=0.2)+
+  geom_errorbar(aes(ymin = ymin_sd,
+                    ymax = ymax_sd), width=0.2, position=position_dodge(width = 0.9), stat = "identity", size=0.2)+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-infected cells", "Infected cells"))+
+  ylab("Mean cell count")+
+  labs(title = "Total cell count")+
+  ggeasy::easy_center_title()+
+  theme(axis.title.x = element_text(size=22))+
+  theme(axis.title.y = element_text(size=22))+
+  theme(axis.text.x = element_text(size=20, angle = 45, vjust = 1, hjust=1))+
+  theme(axis.text.y = element_text(size=20))+
+  theme(legend.text = element_text(size=20))+
+  theme(strip.text.x = element_text(size = 20))
+
+
+total_cell_count_ICV
+
+
+Species_IDV <- subset(all_cells, virus==c("IDV")) 
+
+total_cell_count_IDV <- ggplot(Species_IDV, aes(x=temperature, y=cell_count_mean, fill=infected_cell))+
+  facet_wrap(~species, scales = "free", ncol=3, nrow=1, labeller = labeller(species = species.labs))+
+  geom_bar(position = "dodge",  stat = "identity", colour = "black", size=0.2)+
+  geom_errorbar(aes(ymin = ymin_sd,
+                    ymax = ymax_sd), width=0.2, position=position_dodge(width = 0.9), stat = "identity", size=0.2)+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-infected cells", "Infected cells"))+
+  ylab("Mean cell count")+
+  labs(title = "Total cell count")+
+  ggeasy::easy_center_title()+    
+  theme(axis.title.x = element_text(size=22))+
+  theme(axis.title.y = element_text(size=22))+
+  theme(axis.text.x = element_text(size=20, angle = 45, vjust = 1, hjust=1))+
+  theme(axis.text.y = element_text(size=20))+
+  theme(legend.text = element_text(size=20))+
+  theme(strip.text.x = element_text(size = 20))
+
+
+total_cell_count_IDV
+
+```
+# total cell count in cells/mm2
+
+```{r}
+#make table with information of image sizes
+
+Norm_df <- data.frame(species=c("H", "P", "B"), magnification = c("20x", "20x", "40x"), 
+                      HandW = c(694, 694, 153.6))
+
+#um2=area of image, mm2= area of image in mm2
+
+Norm_df <- Norm_df %>%
+  left_join(Norm_df)%>%
+  mutate(species, magnification, HandW, um2 = (Norm_df$HandW)^2, mm2=um2/1e6) 
+
+#normalize cell count in cells/mm2
+normalization_cells <- df2 %>%
+  group_by(species) %>%
+  left_join(Norm_df)%>%
+  mutate(cell_mm2 = (cell_count_donor/mm2))
+
+#mean cell count/m2 (infected and non infected)
+
+cellsarea <- normalization_cells%>%
+  group_by(species, temperature, virus, infected_cell) %>%
+  summarise(cell_area_mean = mean(cell_mm2), sd=sd(cell_mm2), 
+            sem=sd(cell_mm2)/sqrt(length(cell_mm2)), 
+            ymin_sd = cell_area_mean-sd,
+            ymax_sd = cell_area_mean+sd,
+            ymin_sem = cell_area_mean - sem,
+            ymax_sem = cell_area_mean + sem) %>%
+  ungroup %>%
+  complete(nesting(species, temperature, virus),
+           nesting(infected_cell),
+           fill = list(cell_area_mean = 0))
+
+#display in graph
+cellsarea$cell_area_mean <- as.numeric(cellsarea$cell_area_mean)
+
+cellsarea$species <- factor(cellsarea$species, levels = c("H", "P", "B"))
+
+cellsarea$species <- as.factor(cellsarea$species)
+cellsarea$infected_cell <- as.factor(cellsarea$infected_cell)
+cellsarea$virus <- as.factor(cellsarea$virus)
+cellsarea$temperature <- as.factor(cellsarea$temperature)
+cellsarea$sd <- as.numeric(cellsarea$sd)
+cellsarea$sem <- as.numeric(cellsarea$sem)
+cellsarea$ymin_sd <- as.numeric(cellsarea$ymin_sd)
+cellsarea$ymax_sd <- as.numeric(cellsarea$ymax_sd)
+cellsarea$ymin_sem <- as.numeric(cellsarea$ymin_sem)
+cellsarea$ymax_sem <- as.numeric(cellsarea$ymax_sem)
+cellsarea$temperature <- paste0(cellsarea$temperature, "°C") #adding Temperature symbol to variable
+
+
+#as dodge plot 
+plot_cellsarea <- ggplot(cellsarea, aes(x=temperature, y=cell_area_mean, fill=infected_cell))+
+  facet_wrap(species~virus, scales = "free", ncol=2, nrow=3, labeller = labeller(species = species.labs))+
+  geom_bar(position = "dodge",  stat = "identity", colour = "black", size=0.2)+
+  geom_errorbar(aes(ymin = ymin_sd,
+                    ymax = ymax_sd), width=0.2, position=position_dodge(width = 0.9), stat = "identity", size=0.2)+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-infected cells", "Infected cells"))+
+  ylab("Number of cells per mm2")+
+  #labs(title = "Total cell count")+
+  ggeasy::easy_center_title()
+
+plot_cellsarea
+
+#separate for ICV and IDV
+
+ICV_cells_area <- subset(cellsarea, virus==c("ICV"))
+
+ICV_cells_area <- ggplot(ICV_cells_area, aes(x=temperature, y=cell_area_mean, fill=infected_cell))+
+  facet_wrap(~species, scales = "free", ncol=3, nrow=1, labeller = labeller(species = species.labs))+
+  geom_bar(position = "dodge",  stat = "identity", colour = "black", size=0.2)+
+  geom_errorbar(aes(ymin = ymin_sd,
+                    ymax = ymax_sd), width=0.2, position=position_dodge(width = 0.9), stat = "identity", size=0.2)+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-infected cells", "Infected cells"))+
+  theme_bw()+
+  ylab("Number of cells per mm2")+
+  labs(title = "ICV")+
+  ggeasy::easy_center_title()+
+  theme(title = element_text(size=26))+
+  theme(axis.title.x = element_text(size=26))+
+  theme(axis.title.y = element_text(size=26))+
+  theme(axis.text.x = element_text(size=24, angle = 45, vjust = 1, hjust=1))+
+  theme(axis.text.y = element_text(size=24))+
+  theme(legend.text = element_text(size=24))+
+  theme(strip.text.x = element_text(size = 24))
+
+ICV_cells_area
+
+IDV_cells_area <- subset(cellsarea, virus==c("IDV"))
+
+IDV_cells_area <- ggplot(IDV_cells_area, aes(x=temperature, y=cell_area_mean, fill=infected_cell))+
+  facet_wrap(~species, scales = "free", ncol=3, nrow=1, labeller = labeller(species = species.labs))+
+  geom_bar(position = "dodge",  stat = "identity", colour = "black", size=0.2)+
+  geom_errorbar(aes(ymin = ymin_sd,
+                    ymax = ymax_sd), width=0.2, position=position_dodge(width = 0.9), stat = "identity", size=0.2)+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-infected cells", "Infected cells"))+
+  theme_bw()+
+  ylab(NULL)+
+  labs(title = "IDV")+
+  ggeasy::easy_center_title()+
+  theme(title = element_text(size=26))+
+  theme(axis.title.x = element_text(size=26))+
+  theme(axis.title.y = element_text(size=26))+
+  theme(axis.text.x = element_text(size=24, angle = 45, vjust = 1, hjust=1))+
+  theme(axis.text.y = element_text(size=24))+
+  theme(legend.text = element_text(size=24))+
+  theme(strip.text.x = element_text(size = 24))
+
+IDV_cells_area
+
+```
+#check significance
+```{r}
+#normality test
+uninfected <- normalization_cells%>%
+  subset(infected_cell=="0")%>%
+  group_by(species)%>%
+  shapiro_test(cell_mm2)
+
+#t.test uninfected vs infected
+pwc1 <- normalization_cells %>%
+  group_by(species, virus, temperature)%>%
+  pairwise_t_test(cell_mm2 ~ infected_cell, paired = T) %>%
+  add_significance() %>%
+  add_xy_position(x="temperature", dodge = 0.9)
+pwc1
+
+#t.test  infected panels 33 vs 37°C
+pwc2 <- normalization_cells %>%
+  subset(infected_cell=="1")%>%
+  group_by(species, virus)%>%
+  pairwise_t_test(cell_mm2 ~ temperature, paired = T) %>%
+  add_significance() %>%
+  add_xy_position(x="temperature", dodge = 0.9)
+pwc2
+
+```
+
+
+#graph infected cells only
+
+```{r}
+
+a <- Species_IS %>%
+  subset(infected_cell==c("1"), .preserve=TRUE)%>%
+  group_by(species, temperature, virus, donor, ciliated_cell, image) %>%
+  summarise(cell_image = mean((length(label)))) %>%
+  ungroup %>%
+  complete(nesting(species, temperature, virus, donor, image),
+           nesting(ciliated_cell),
+           fill = list(ciliated_cell = 0, cell_image = 0))
+
+b <- a %>%
+  group_by(species, temperature, virus, donor, ciliated_cell) %>%
+  summarise(donor_cellcount = mean(cell_image)) %>%
+  ungroup %>%
+  complete(nesting(species, temperature, virus),
+           nesting(ciliated_cell),
+           fill = list(ciliated_cell = 0, donor_cellcount = 0))
+
+infected_cells <- b %>%
+  group_by(species, temperature, virus, ciliated_cell) %>%
+  summarise(mean_cellcount = mean(donor_cellcount)) %>%
+  ungroup %>%
+  complete(nesting(species, temperature, virus),
+           nesting(ciliated_cell),
+           fill = list(ciliated_cell = 0, mean_cellcount = 0))
+
+infected_cells$species <- factor(infected_cells$species, levels=c("H", "P", "B"))
+ 
+infected_cells$species <- as.factor(infected_cells$species)
+infected_cells$ciliated_cell <- as.factor(infected_cells$ciliated_cell)
+infected_cells$virus <- as.factor(infected_cells$virus)
+infected_cells$cell_count_mean <- as.numeric(infected_cells$mean_cellcount)
+
+infected_cells$temperature <- as.factor(infected_cells$temperature)
+infected_cells$temperature <- paste0(infected_cells$temperature, "°C") #adding Temperature symbol to variable
+
+
+#percentage 
+ggplot(infected_cells, aes(x=temperature, y=mean_cellcount, fill=ciliated_cell))+
+  facet_wrap(species~virus, ncol=2, nrow=3, labeller = labeller(species = species.labs))+
+  geom_bar(position = "fill",stat="identity", colour = "black", size=0.2)+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-ciliated cells", "Ciliated cells"))+
+  ylab("Percentage cell count")+
+  labs(title = "Infected cells")+
+  ggeasy::easy_center_title()
+
+
+#Separate ICV from IDV
+
+#ICV graph
+
+Species_ICV_infected <- subset(infected_cells, virus==c("ICV")) 
+ 
+#percentage
+ICV_percentage <- ggplot(Species_ICV_infected, aes(x=temperature, y=cell_count_mean, fill=ciliated_cell))+
+  facet_wrap(~species, ncol=3, nrow=1, labeller = labeller(species = species.labs))+
+  geom_bar(position = "fill",stat="identity", colour = "black", size=0.2)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-ciliated cells", "Ciliated cells"))+
+  theme_bw()+
+  ylab("Percentage cell count")+
+  #labs(title = "ICV infected cells")+
+  ggeasy::easy_center_title()+
+  theme(axis.title.x = element_text(size=26))+
+  theme(axis.title.y = element_text(size=26))+
+  theme(axis.text.x = element_text(size=24, angle = 45, vjust = 1, hjust=1))+
+  theme(axis.text.y = element_text(size=24))+
+  theme(legend.text = element_text(size=24))+
+  theme(strip.text.x = element_text(size = 24))
+
+ICV_percentage
+
+#IDV graph
+
+
+Species_IDV_infected <- subset(infected_cells, virus==c("IDV")) 
+
+#percentage
+IDV_percentage <- ggplot(Species_IDV_infected, aes(x=temperature, y=cell_count_mean, fill=ciliated_cell))+
+  facet_wrap(~species, ncol=3, nrow=1, labeller = labeller(species = species.labs))+
+  geom_bar(position = "fill",stat="identity", colour = "black", size=0.2)+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+  scale_fill_manual(name = NULL, values = c("#fddbc7","#d73027"), breaks = c("0", "1"), labels = c("Non-ciliated cells", "Ciliated cells"))+
+  theme_bw()+
+  ylab(NULL)+
+  #labs(title = "IDV infected cells")+
+  ggeasy::easy_center_title()+
+  theme(axis.title.x = element_text(size=26))+
+  theme(axis.title.y = element_text(size=26))+
+  theme(axis.text.x = element_text(size=24, angle = 45, vjust = 1, hjust=1))+
+  theme(axis.text.y = element_text(size=24))+
+  theme(legend.text = element_text(size=24))+
+  theme(strip.text.x = element_text(size = 24))
+
+IDV_percentage
+ 
+```
