@@ -4,21 +4,27 @@
 	- regex: `re.findall('.+_.+_.+_(.+)_.+\.tif',filename)`
 - saving intermediate results, such as segmentation: `cellpose.io.masks_flows_to_seg(imgs, masks, flows, diams, to_segment, channels)`
 - saving summary images such as signals with segmentation
+---
 - 3D segmentation (not in script, but Cellpose website)
 - Cell properties, but not really used:
 	- `regions = skimage.measure.regionprops_table(skimage.measure.label(maski), intensity_image=measi, properties=('label','area',"perimeter",'mean_intensity', "feret_diameter_max", "major_axis_length", "minor_axis_length"))`
 	- `regions = pd.DataFrame(regions)`
 	- --> area | perimeter | mean_intensity | feret_diameter_max | major_axis_length | minor_axis_length
 ---
-- `inf_lvl = np.log10(mean)` --> `mock_mean = mean(inf_lvl[mocks])` --> `inf = inf_lvl > mock_mean + 3 mock_sd`
+- Infected thresholding: `inf_lvl = np.log10(mean)` --> `mock_mean = mean(inf_lvl[mocks])` --> `inf = inf_lvl > mock_mean + 3 mock_sd`
 	- --> `results_count["total_cells"]= 1.0 --> groupby(["experiment", "virus", "replicate", "channel"]).sum().reset_index()`
 	- --> gives sum of infected (each is 0 or 1) and total cells (each is 1) for each replicate
 - ( `results_infection.groupby(["experiment", "virus", "replicate", "channel"]).mean().reset_index()` --> mean of each value across cells in each replicate )
 ---
 - `add_stat_annotation(ax, data=all_results_summary, x=x, y=y, hue=hue, box_pairs=box_pairs, test='t-test_paired',  comparisons_correction= None, loc='inside', verbose=2)` --> significance of differences added to sns plot
 
+---
 
-**=> ' log10 of signal --> +3*SD from mock_mean ' = infected (instead of finding threshold from distribution)**
+**==> FILES handling and saving**
+
+**=> THRESHOLDING: ' log10 of mean signal --> +3*SD from mock_mean ' = infected (instead of finding threshold from distribution)**
+
+**// ==> USE 3D segmentation/data** ==> NO, given the data we have, projections are better
 
 
 
@@ -26,11 +32,11 @@
 
 ### General ideas
 
-- Clean data from too small cells
+- Clean data from too small cells ?
 
 - Thresholding for infection:
 	`mutate(Cy5_mean_intensity=Cy5_mean_intensity, GFP_mean_intensity=GFP_mean_intensity,
-                  infected_cell = ifelse(GFP_mean_intensity > mean_sd, 1, 0))`
+                  infected_cell = ifelse(GFP_mean_intensity > mean_sd, 1, 0))` where mean_sd is mean + 3* SD of mock
 - Thresholding for cilia (comparison with mock makes no sense):
 	- `mutate(loc = (locmodes(cilia, mod0 = 2, display = FALSE))$locations[2])`
 		- For each group (i.e., per image), it calculates modes in the cilia intensity distribution using the `locmodes()` function from the multimode package.
@@ -59,7 +65,7 @@
 - Count cells per image and then per donor --> average per donor
 - Calculate mean, SD, and SEM of cell counts per condition (group of species/temp/virus/infection status)
 
-2. **Normalize by area**
+2. **Normalize by area** -> Necessary for us?
 - Manually create a table of species-specific image dimensions
 - Compute image area
 - Normalize cell counts to cells/mm² ( mutate(cell_mm2 = cell_count_donor / mm2) )
