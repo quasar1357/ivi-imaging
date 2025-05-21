@@ -36,7 +36,7 @@
 
 - Thresholding for infection:
 	`mutate(Cy5_mean_intensity=Cy5_mean_intensity, GFP_mean_intensity=GFP_mean_intensity,
-                  infected_cell = ifelse(GFP_mean_intensity > mean_sd, 1, 0))` where mean_sd is mean + 3* SD of mock
+                  infected_cell = ifelse(GFP_mean_intensity > mean_sd, 1, 0))` where mean_sd is mean_of_log10 + 3* SD_of_log10 of mock
 - Thresholding for cilia (comparison with mock makes no sense):
 	- `mutate(loc = (locmodes(cilia, mod0 = 2, display = FALSE))$locations[2])`
 		- For each group (i.e., per image), it calculates modes in the cilia intensity distribution using the `locmodes()` function from the multimode package.
@@ -71,14 +71,14 @@
 - Normalize cell counts to cells/mm² ( mutate(cell_mm2 = cell_count_donor / mm2) )
 - Summarize across experimental groups with mean cell density, SD and SEM ...
 
-3. **Statistical tests (on normalized data)**
+3. **Statistical tests (on area-normalized data)**
 - Apply a Shapiro-Wilk test on cell_mm2 of uninfected cells to test for normality within each species
 - Pairwise t-test 1: Infected vs Uninfected
 If your dataset includes different donors or samples between infected and uninfected conditions, this assumption breaks, and you should use:
 `pairwise_t_test(cell_mm2 ~ infected_cell, paired = FALSE)`
 - Pairwise t-test 2: Compares 33°C vs 37°C within infected samples
 
-4. **Final summary (on NON-normalized data !)**
+4. **Final summary (on NON-area-normalized data !)**
 - Image-level summary of infected ciliated/non-ciliated cells
 	- Filter only infected cells (`infected_cell == "1"`)
 	- Group by all relevant metadata + ciliated status + image
