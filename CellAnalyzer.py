@@ -58,8 +58,11 @@ class CellAnalyzer:
         output_path = self.path / folder_name
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Save the DataFrame
-        self.df.to_csv(output_path / "metadata.csv", index=False)
+        # Save the DataFrames
+        if self.df is not None:
+            self.df.to_csv(output_path / "metadata.csv", index=False)
+        if self.cells_df is not None:
+            self.cells_df.to_csv(output_path / "cells_metadata.csv", index=False)
 
         # Save the object
         data_to_save = {
@@ -192,7 +195,7 @@ class CellAnalyzer:
         
         Parameters:
             types : list of str
-                The type of projection to create for each channel. Options are "sum", "max", "min", "mean".
+                The type of projection to create for each channel. Options are "max", "min", "mean", "median", "sum".
 
         Returns:
             projections : np.array or list of np.arrays
@@ -216,14 +219,16 @@ class CellAnalyzer:
                 if z_axis > c_axis:
                     z_axis -= 1
                 # Create the projection
-                if proj_type == "sum":
-                    proj = np.sum(img_channel, axis=z_axis)
-                elif proj_type == "max":
+                if proj_type == "max":
                     proj = np.max(img_channel, axis=z_axis)
                 elif proj_type == "min":
                     proj = np.min(img_channel, axis=z_axis)
                 elif proj_type == "mean":
                     proj = np.mean(img_channel, axis=z_axis)
+                elif proj_type == "median":
+                    proj = np.median(img_channel, axis=z_axis)
+                elif proj_type == "sum":
+                    proj = np.sum(img_channel, axis=z_axis)
                 else:
                     raise ValueError(f"Projection type '{proj_type}' not recognized. Use 'sum', 'max', 'min', or 'mean'.")  
                 # Append the projection to the list
@@ -300,17 +305,16 @@ class CellAnalyzer:
         prev_max = 0
         new_masks = []
         for i, mask in enumerate(masks):
-            new_mask = mask.astype("int16").copy()
+            new_mask = mask.copy().astype("int16")
             # Add the number of cells to the DataFrame (as int)
-            new_max = mask.max()
-            self.df.at[i, "num_cells"] = new_max - prev_max
+            self.df.at[i, "num_cells"] = new_mask.max()
             # Make the cell IDs unique
             new_mask += prev_max
             new_mask[new_mask == prev_max] = 0
 
             # Save the cell IDs in the DataFrame
             self.df.at[i, "cell_id_min"] = prev_max + 1
-            self.df.at[i, "cell_id_max"] = new_max
+            self.df.at[i, "cell_id_max"] = new_mask.max()
 
             # Set the previous max to the current max
             prev_max = new_mask.max()
@@ -319,7 +323,7 @@ class CellAnalyzer:
             new_masks.append(new_mask)
 
         # Save the new masks in the object
-        self.masks = new_masks
+        self.new_masks = new_masks
 
         # Make sure the columns are ints
         self.df["cell_id_min"] = self.df["cell_id_min"].astype(int)
@@ -366,7 +370,7 @@ class CellAnalyzer:
         # Reset the index
         self.cells_df.reset_index(drop=True, inplace=True)
 
-    def save_segmentations(self, folder_name="segmentations"):
+    def save_segmentations(self, folder_name="segmentations", background_channels=None):
         """
         Saves the segmentation results to a file.
         """
@@ -378,15 +382,20 @@ class CellAnalyzer:
         # Create the folder if it doesn't exist
         out_folder.mkdir(parents=True, exist_ok=True)
 
-        # OUTLINES WITH DENOISED IMAGES AS BACKGROUND
+        # OUTLINES WITH CHOSEN BACKGOUND CHANNELS
+        if background_channels is None:
+            background_channels = self.seg_channels
+        else:
+            background_channels = [n-1 for n in background_channels] # Decrease by 1 to make it 0-indexed
         # Take the denoised images and add channels such that it's a RGB image
-        for i, img in enumerate(self.imgs_dn):
+        for i, img in enumerate(self.projections):
             outline = self.outlines[i]
             # Create a new image with 3 channels, to overlay the outlines
-            h, w, _ = img.shape
+            _, h, w = img.shape
             img_rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            for c in range(img.shape[2]):
-                channel = img[:, :, c]
+            for c in range(2):
+                channel = img[c, :, :]
+                np.moveaxis(channel, 0, -1)  # Move the channel axis to the last dimension
                 # Normalize the channel to 0-255
                 channel = (channel - channel.min()) / (channel.max() - channel.min()) * 255
                 channel = np.clip(channel, 0, 255)
@@ -403,6 +412,7 @@ class CellAnalyzer:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
                 img_rgb.save(img_dir)
+        print("Outlines saved.")
         
         # MASKS
         for i, mask in enumerate(self.masks):
@@ -424,8 +434,7 @@ class CellAnalyzer:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
                 mapped.save(out_folder / f"{self.df['filename'][i]}_masks.png")
-
-        print("Segmentation results saved.")
+        print("Masks saved.")
 
     def get_means(self, channels, dilate=None):
         """
