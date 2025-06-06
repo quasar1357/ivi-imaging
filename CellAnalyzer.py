@@ -513,63 +513,45 @@ class CellAnalyzer:
             self.signals_lists[name] = signals_lists_out
             self.signals_masks[name] = signals_masks_out
         
-
-    def get_bins(self, signal, thresh=None):
+    def get_bins(self, signal, thresh=None, col_name=None):
         """
-        Puts the mean signal of each cell in bins based on a threshold, assigning 1 (below threshold) or 2 (above threshold).
-        If a list of dictionaries (and optionally cell_masks) is given, each output will be a list containing the results for the dictionaries.
+        Bins the signal of each cell in the cell_df dataframe based on one or multiple thresholds.
+        The bins will be called "negative" and "positive" if only one threshold is given,
+        "negative", "medium" and "positive" if three thresholds are given, and will be numbered otherwise.
 
         Parameters:
-            means_dicts_in : dict or list of dicts
-                The mean signal of each cell in the image(s) as a dictionary.
-            thresh : float
-                The threshold to use for the binning.
-            cell_masks_in : np.array or list of np.arrays, optional
-                An image containing the masks of the cells in the image(s).
-                If given, the bins will be applied to the masks.
-
-        Returns:
-            bins_dicts_out : dict or list of dicts
-                The bins of the mean signal of each cell in the image(s) as a dictionary.
-            bins_lists_out : list or list of lists
-                The bins of the mean signal of each cell in the image(s) as a list. (Loses cell IDs.)
-            bins_masks_out : np.array or list of np.arrays
-                An image in which, for each cell, the bin is assigned to its pixels.
-                None if cell_masks_in is None.
+            signal: str
+                The name of the signal to bin. Must be a key in the signals_dicts attribute.
+            thresh: float, list of floats or None
+                The threshold(s) to use for binning the signal.
+                If None, Otsu's method is used on the mean signal of the cells.
+                If a list, three or more bins are created.
+            col_name: str, optional
+                The name of the column to create in the cells_df DataFrame.
+                If None, the column name will be the signal name with "_bin" appended.
         """
 
-        means_dicts = self.signals_dicts[signal]
-        means_lists = self.signals_dicts[signal]
-        cell_masks = self.signals_dicts[signal]
+        if signal not in self.cells_df.columns:
+            raise ValueError(f"Signal '{signal}' not found as a column of cells_df. Please run get_cell_signals() first.")
         
-        # If there is no threshold given from higher levels, use otsu on single sample as default
         if thresh is None:
-            sample_thresh = threshold_otsu(np.array([v for v in means_list]))
-            print("sample_thresh", sample_thresh)
+            signals = np.array(self.cells_df[signal].dropna())
+            # Use Otsu's method to find the threshold
+            thresh = threshold_otsu(signals)
+            print(f"Using Otsu's method to find the threshold for {signal}: {thresh}")
+
+        # Use thresholds if given
+        if isinstance(thresh, float):
+            thresh = [thresh]
+            bins = ["negative", "positive"]
         else:
-            sample_thresh = thresh
-        # Create bins using the threshold
-        bins_dict = {cell_id: 2 if val > sample_thresh else 1 for cell_id, val in means_dict.items()}
-        bins_list = [val for k, val in bins_dict.items()]
-
-        # Create mask and add entries to the table
-        bins_mask = np.zeros_like(cell_mask, dtype=np.float32)
-        # Add each bin to the mask
-        for cell_id in bins_dict.keys():
-            single_cell_mask = cell_mask == cell_id
-            cell_bin = bins_dict[cell_id]
-            bins_mask += cell_bin * single_cell_mask
-            
-            # Add the bin to the cell_df
-            self.cells_df.loc[self.cells_df["cell_id"] == cell_id, signal + "_bin"] = cell_bin
-
-        bins_mask = bins_mask.astype(np.uint8)
-        
-        # Save the bins in the object
-        self.signals_dicts[signal + "_bins"] = bins_dict
-        self.signals_lists[signal + "_bins"] = bins_list
-        self.signals_masks[signal + "_bins"] = bins_mask
-
+            thresh.sort()
+            bins = ["negative", "medium", "positive"] if len(thresh) == 2 else [i for i in range(len(thresh)+1)]
+        col_name = col_name if col_name is not None else signal + "_bin"
+        self.cells_df[col_name] = bins[0]  # Initialize the column with the first bin
+        for thresh, bin_name in zip(thresh, bins[1:]):
+            # Set the bin for the cells that are above the threshold
+            self.cells_df.loc[self.cells_df[signal] > thresh, col_name] = bin_name
 
     def get_pop(bins_1_in, bins_2_in, bin1_name=None, bin2_name=None):
         """
@@ -672,7 +654,6 @@ class CellAnalyzer:
         
         return cell_pop_dicts_out, pop_counts_out, pop_counts_df_out, pop_counts_matrix_dfs_out
 
-
     def get_sep_rel_pop_counts_df(pop_counts_df, bin1_name=None, bin2_name=None):
         """
         Takes a DataFrame with the population counts and returns the counts of the two bins
@@ -719,7 +700,6 @@ class CellAnalyzer:
         rel = {keys[0]: df_1_rel, keys[1]: df_2_rel}
 
         return abs, rel
-
 
     def get_pop_mask(cell_pop_dicts_in, cell_masks_in):
         """
@@ -874,7 +854,6 @@ class CellAnalyzer:
 
         return masks, means, bins, cell_pop_dicts, pop_counts, overall_count_df, rel
 
-
     def plot_bin2_in_bin1(rel_in):
         """
         Plots the relative populations of bin2 in bin1.
@@ -901,7 +880,6 @@ class CellAnalyzer:
         plt.gca().spines['top'].set_visible(False)
         plt.gca().spines['right'].set_visible(False)
         plt.show()
-
 
     def plot_bins(rel_in):
         
