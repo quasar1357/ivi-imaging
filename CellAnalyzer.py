@@ -29,15 +29,15 @@ class CellAnalyzer:
         self.styles = None
         self.imgs_dn = None
         self.outlines = None
-        self.signal_means_dicts = {}
-        self.signal_means_lists = {}
-        self.signal_means_masks = {}
+        self.signals_dicts = {}
+        self.signals_lists = {}
+        self.signals_masks = {}
         self.cells_df = None
 
         # Load cellpose model
-        self.load_cellpose()
+        self.load_cellpose_model()
 
-    def save(self, folder_name=None):
+    def save(self, folder_name=None, overwrite=False):
         """
         Saves the data frame in a csv and the object in a pickle file.
         
@@ -51,7 +51,7 @@ class CellAnalyzer:
         if folder_name is None:
             folder_name = "CellAnalyzer"
         # Check if the file already exists
-        if (self.path / folder_name).exists():
+        if (self.path / folder_name).exists() and not overwrite:
             raise ValueError(f"Folder {folder_name} already exists. Please choose a different name.")
 
         # Create the folder if it doesn't exist
@@ -77,9 +77,9 @@ class CellAnalyzer:
             'styles': self.styles,
             'imgs_dn': self.imgs_dn,
             'outlines': self.outlines,
-            'signal_means_dicts': self.signal_means_dicts,
-            'signal_means_lists': self.signal_means_lists,
-            'signal_means_masks': self.signal_means_masks,
+            'signal_means_dicts': self.signals_dicts,
+            'signals_lists': self.signals_lists,
+            'signals_masks': self.signals_masks,
             'cells_df': self.cells_df,
         }
 
@@ -112,12 +112,12 @@ class CellAnalyzer:
         loaded_instance.img_arrays = [img.get_image_data("CZYX", T=0) for img in loaded_instance.img_arrays]
 
         # Cellpose model
-        loaded_instance.load_cellpose()
+        loaded_instance.load_cellpose_model()
 
         # Return the loaded instance
         return loaded_instance
     
-    def load_cellpose(self):
+    def load_cellpose_model(self):
         # Initializations for Cellpose
         use_GPU = core.use_gpu()
         yn = ['NO', 'YES']
@@ -148,7 +148,7 @@ class CellAnalyzer:
             r'(?P<donor>BEC\d+)_'
             r'(?P<time>\d+h)_'
             r'(?P<date>\d{2}\.\d{2}\.\d{2})'
-            r'(?:\.(?P<replicate>\d+))?_'
+            r'(?:\.(?P<sample>\d+))?_'
             r'(?P<mode1>[A-Z0-9]+)_'
             r'(?P<mode2>[A-Z0-9]+)\.dv$'
         )
@@ -165,23 +165,34 @@ class CellAnalyzer:
         # Create DataFrame
         df = pd.DataFrame(records)
 
-        # Replace None as replicate with 00
-        df['replicate'] = df['replicate'].fillna('00')
+        # Replace None as sample with 00
+        df['sample'] = df['sample'].fillna('00')
 
-        # Sort the DataFrame by condition, donor, time, date, and replicate
-        df.sort_values(by=['condition', 'donor', 'time', 'date', 'replicate'], inplace=True)
+        # Sort the DataFrame by condition, donor, time, date, and sample
+        df.sort_values(by=['condition', 'donor', 'time', 'date', 'sample'], inplace=True)
+
+        # Create a new column for "replicate", which is u unique number within each condition-donor group
+        df['replicate'] = df.groupby(['condition', 'donor']).cumcount() + 1
+        # Put it right after "sample"
+        sample_index = df.columns.get_loc('sample') + 1
+        df.insert(sample_index, 'replicate', df.pop('replicate'))
+        # Also create a column for a unique sample ID
+        df['sample_id'] = df["donor"] + "_" + df["replicate"].astype(str)
+        # Put it right after "replicate"
+        replicate_index = df.columns.get_loc('replicate') + 1
+        df.insert(replicate_index, 'sample_id', df.pop('sample_id'))
 
         # Reset index
         df.reset_index(drop=True, inplace=True)
 
         if not df.empty:
-            df['date'] = pd.to_datetime(df['date'], format="%d.%m.%y")
+            df['date'] = pd.to_datetime(df['date'], format="%y.%m.%d")
 
         # Load the image
         imgs = [AICSImage(df["filepath"][i]) for i in range(len(df))]
-        print(len(imgs), "images loaded")
         # Convert to numpy array
         img_arrays = [img.get_image_data("CZYX", T=0) for img in imgs] # 3D image stack, all channels
+        print(len(img_arrays), "images loaded")
 
         # Save in the object
         self.df = df
@@ -322,27 +333,24 @@ class CellAnalyzer:
             # Append the new mask to the list
             new_masks.append(new_mask)
 
-        # Save the new masks in the object
-        self.new_masks = new_masks
-
         # Make sure the columns are ints
         self.df["cell_id_min"] = self.df["cell_id_min"].astype(int)
         self.df["cell_id_max"] = self.df["cell_id_max"].astype(int)
         self.df["num_cells"] = self.df["num_cells"].astype(int)
 
-        # Start a new df with a row per cell
-        self.create_cells_df()
-
         # Save the masks, flows, styles and denoised images in the object
         self.seg_channels = channels
         self.seg_diameter = diameter
-        self.masks = masks
+        self.masks = new_masks
         self.flows = flows
         self.styles = styles
         self.imgs_dn = imgs_dn
         self.outlines = outlines
 
-        return masks, flows, styles, imgs_dn, outlines
+        # Start a new df with a row per cell
+        self.create_cells_df()
+
+        return new_masks, flows, styles, imgs_dn, outlines
     
     def create_cells_df(self):
         """
@@ -355,10 +363,8 @@ class CellAnalyzer:
             # Get the cell ID range for this image
             cell_id_min = row["cell_id_min"]
             cell_id_max = row["cell_id_max"]
-            # Create a list of cell IDs
-            cell_ids = list(range(cell_id_min, cell_id_max + 1))
             # Create a new row for each cell
-            for cell_id in cell_ids:
+            for cell_id in range(cell_id_min, cell_id_max + 1):
                 new_row = row.copy()
                 new_row["cell_id"] = cell_id
                 cells_data.append(new_row)
@@ -370,7 +376,7 @@ class CellAnalyzer:
         # Reset the index
         self.cells_df.reset_index(drop=True, inplace=True)
 
-    def save_segmentations(self, folder_name="segmentations", background_channels=None):
+    def save_segmentation_imgs(self, folder_name="segmentations", background_channels=None, overwrite=False):
         """
         Saves the segmentation results to a file.
         """
@@ -408,7 +414,7 @@ class CellAnalyzer:
             img_rgb = Image.fromarray(img_rgb)
             img_dir = out_folder / f"{self.df['filename'][i]}_outlines.png"
             # Check if the file already exists
-            if img_dir.exists():
+            if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
                 img_rgb.save(img_dir)
@@ -430,13 +436,13 @@ class CellAnalyzer:
             mapped = Image.fromarray(mapped)
             img_dir = out_folder / f"{self.df['filename'][i]}_masks.png"
             # Check if the file already exists
-            if img_dir.exists():
+            if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
                 mapped.save(out_folder / f"{self.df['filename'][i]}_masks.png")
         print("Masks saved.")
 
-    def get_means(self, channels, dilate=None):
+    def get_cell_signals(self, channels, dilate=None, mode="mean"):
         """
         Extracts the mean signal of each cell in the input image(s) based on the masks.
         Will populate the signal_means_dicts, signal_means_lists and signal_means_masks attributes.
@@ -465,43 +471,50 @@ class CellAnalyzer:
             # Reduce the channel number by one (0-indexed)
             num -= 1
             # Prepare the empty containers
-            signal_means_dicts_out = []
-            signal_means_lists_out = []
-            signal_means_masks_out = []
+            signals_dicts_out = []
+            signals_lists_out = []
+            signals_masks_out = []
             for img, mask in zip(self.projections, self.masks):
                 # Extract the channel from the image
                 img = img[num]
                 # Prepare the empty containers
-                img_signal_means_dict = {} #{cell_id: np.mean(img[cell_mask_for_mean]) for cell_id in range(1, mask.max()+1)}
-                img_signal_means_list = [] #[val for k, val in img_signal_means_dict.items()]
-                img_signal_means_mask = np.zeros_like(img, dtype=np.float32)
-                # add the mean to the dict and mask
+                img_signals_dict = {} #{cell_id: np.mean(img[cell_mask_for_mean]) for cell_id in range(1, mask.max()+1)}
+                img_signals_list = [] #[val for k, val in img_signal_means_dict.items()]
+                img_signals_mask = np.zeros_like(img, dtype=np.float32)
+                # add the signal to the dict and mask
                 lowest_non_zero = mask[mask != 0].min()
                 for cell_id in range(lowest_non_zero, mask.max()+1):
                     cell_mask = mask == cell_id
-                    cell_mask_for_mean = cell_mask.copy()
+                    cell_mask_for_signal = cell_mask.copy()
                     if dilate[name] > 0:
-                        cell_mask_for_mean = morphology.binary_dilation(cell_mask_for_mean, morphology.disk(dilate[name]))
+                        cell_mask_for_signal = morphology.binary_dilation(cell_mask_for_signal, morphology.disk(dilate[name]))
                     elif dilate[name] < 0:
-                        cell_mask_for_mean = morphology.binary_erosion(cell_mask_for_mean, morphology.disk(-dilate[name]))
-                    cell_mean = np.mean(img[cell_mask_for_mean])
-                    img_signal_means_dict[cell_id] = cell_mean
-                    img_signal_means_list.append(cell_mean)
-                    img_signal_means_mask += cell_mean * cell_mask
+                        cell_mask_for_signal = morphology.binary_erosion(cell_mask_for_signal, morphology.disk(-dilate[name]))
+                    if mode == "mean":
+                        cell_signal = np.mean(img[cell_mask_for_signal])
+                    elif mode == "median":
+                        cell_signal = np.median(img[cell_mask_for_signal])
+                    else:
+                        raise ValueError(f"Mode '{mode}' not recognized. Check docstring for options.")
+                    img_signals_dict[cell_id] = cell_signal
+                    img_signals_list.append(cell_signal)
+                    img_signals_mask += cell_signal * cell_mask
 
-                    # Add the mean to the cell_df
-                    self.cells_df.loc[self.cells_df["cell_id"] == cell_id, name+"_mean"] = cell_mean
+                    # Add the signal to the cell_df
+                    self.cells_df.loc[self.cells_df["cell_id"] == cell_id, name+"_"+mode] = cell_signal
+                    # Also add the log10 of the signal
+                    self.cells_df.loc[self.cells_df["cell_id"] == cell_id, name+"_"+mode+"_log10"] = np.log10(cell_signal) if cell_signal > 0 else 0
 
-                signal_means_dicts_out.append(img_signal_means_dict)
-                signal_means_lists_out.append(img_signal_means_list)
-                signal_means_masks_out.append(img_signal_means_mask)
+                signals_dicts_out.append(img_signals_dict)
+                signals_lists_out.append(img_signals_list)
+                signals_masks_out.append(img_signals_mask)
         
-            self.signal_means_dicts[name] = signal_means_dicts_out
-            self.signal_means_lists[name] = signal_means_lists_out
-            self.signal_means_masks[name] = signal_means_masks_out
+            self.signals_dicts[name] = signals_dicts_out
+            self.signals_lists[name] = signals_lists_out
+            self.signals_masks[name] = signals_masks_out
         
 
-    def get_bins(means_dicts_in, thresh=None, cell_masks_in=None):
+    def get_bins(self, signal, thresh=None):
         """
         Puts the mean signal of each cell in bins based on a threshold, assigning 1 (below threshold) or 2 (above threshold).
         If a list of dictionaries (and optionally cell_masks) is given, each output will be a list containing the results for the dictionaries.
@@ -525,54 +538,37 @@ class CellAnalyzer:
                 None if cell_masks_in is None.
         """
 
-        if not isinstance(means_dicts_in, list):
-            means_dicts = [means_dicts_in]
-            cell_masks = [cell_masks_in]
-        else:
-            means_dicts = means_dicts_in
-            cell_masks = cell_masks_in
+        means_dicts = self.signals_dicts[signal]
+        means_lists = self.signals_dicts[signal]
+        cell_masks = self.signals_dicts[signal]
         
-        if cell_masks_in is not None and not len(means_dicts) == len(cell_masks):
-            raise ValueError('Length of means_dicts and cell_masks must be the same.')
+        # If there is no threshold given from higher levels, use otsu on single sample as default
+        if thresh is None:
+            sample_thresh = threshold_otsu(np.array([v for v in means_list]))
+            print("sample_thresh", sample_thresh)
+        else:
+            sample_thresh = thresh
+        # Create bins using the threshold
+        bins_dict = {cell_id: 2 if val > sample_thresh else 1 for cell_id, val in means_dict.items()}
+        bins_list = [val for k, val in bins_dict.items()]
 
-        bins_dicts_out = []
-        bins_lists_out = []
-        bins_masks_out = []
-        for means_dict, cell_mask in zip(means_dicts, cell_masks):
-            # If there is no threshold given from higher levels, use otsu on single sample as default
-            if thresh is None:
-                sample_thresh = threshold_otsu(np.array([v for v in means_dict.values()]))
-                print("sample_thresh", sample_thresh)
-            else:
-                sample_thresh = thresh
-            # Create bins using the threshold
-            bins_dict = {cell_id: 2 if val > sample_thresh else 1 for cell_id, val in means_dict.items()}
-            bins_list = [val for k, val in bins_dict.items()]
-
-            bins_dicts_out.append(bins_dict)
-            bins_lists_out.append(bins_list)
-
-            if cell_masks_in is None:
-                bins_masks_out.append(None)
-                continue
+        # Create mask and add entries to the table
+        bins_mask = np.zeros_like(cell_mask, dtype=np.float32)
+        # Add each bin to the mask
+        for cell_id in bins_dict.keys():
+            single_cell_mask = cell_mask == cell_id
+            cell_bin = bins_dict[cell_id]
+            bins_mask += cell_bin * single_cell_mask
             
-            # create mask
-            bins_mask = np.zeros_like(cell_mask, dtype=np.float32)
-            # add each mean
-            for cell_id in bins_dict.keys():
-                single_cell_mask = cell_mask == cell_id
-                cell_bin = bins_dict[cell_id]
-                bins_mask += cell_bin * single_cell_mask
-            bins_mask = bins_mask.astype(np.uint8)
-            bins_masks_out.append(bins_mask)
+            # Add the bin to the cell_df
+            self.cells_df.loc[self.cells_df["cell_id"] == cell_id, signal + "_bin"] = cell_bin
 
-        # return single values if only one image
-        if not isinstance(means_dicts_in, list):
-            bins_dicts_out = bins_dicts_out[0]
-            bins_lists_out = bins_lists_out[0]
-            bins_masks_out = bins_masks_out[0]
-
-        return bins_dicts_out, bins_lists_out, bins_masks_out
+        bins_mask = bins_mask.astype(np.uint8)
+        
+        # Save the bins in the object
+        self.signals_dicts[signal + "_bins"] = bins_dict
+        self.signals_lists[signal + "_bins"] = bins_list
+        self.signals_masks[signal + "_bins"] = bins_mask
 
 
     def get_pop(bins_1_in, bins_2_in, bin1_name=None, bin2_name=None):

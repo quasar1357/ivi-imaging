@@ -5,7 +5,7 @@
 - Normalization across samples -> Controls
 - (Segmentation)
 - Dilation/erotion for mean
-- Alternatives for mean (median, functions, filters...)
+- Alternatives to mean signal (median, functions, filters...)
 - Threshold for binning -> Controls
 - (>2 bins; evtl. with +/- around threshold)
 
