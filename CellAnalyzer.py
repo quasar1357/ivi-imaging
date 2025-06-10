@@ -18,7 +18,7 @@ class CellAnalyzer:
 
         # Initialize the class with the path to the images and the model
         self.path = Path(path)
-        self.df = None
+        self.samples_df = None
         self.img_arrays = None
         self.projections = None
         self.projections_types = None
@@ -33,6 +33,9 @@ class CellAnalyzer:
         self.signals_lists = {}
         self.signals_masks = {}
         self.cells_df = None
+        self.signal_mode = "mean"  # Default mode for signal calculation
+        self.bin_masks = {}
+        self.pop_imgs = []
 
         # Load cellpose model
         self.load_cellpose_model()
@@ -59,15 +62,15 @@ class CellAnalyzer:
         output_path.mkdir(parents=True, exist_ok=True)
 
         # Save the DataFrames
-        if self.df is not None:
-            self.df.to_csv(output_path / "metadata.csv", index=False)
+        if self.samples_df is not None:
+            self.samples_df.to_csv(output_path / "metadata.csv", index=False)
         if self.cells_df is not None:
             self.cells_df.to_csv(output_path / "cells_metadata.csv", index=False)
 
         # Save the object
         data_to_save = {
             'path': self.path,
-            'df': self.df,
+            'df': self.samples_df,
             'projections': self.projections,
             'projections_types': self.projections_types,
             'seg_channels': self.seg_channels,
@@ -81,6 +84,9 @@ class CellAnalyzer:
             'signals_lists': self.signals_lists,
             'signals_masks': self.signals_masks,
             'cells_df': self.cells_df,
+            'signal_mode': self.signal_mode,
+            'bin_masks': self.bin_masks,
+            'pop_imgs': self.pop_imgs
         }
 
         with open(output_path / "CellAnalyzer.pkl", "wb") as f:
@@ -96,7 +102,8 @@ class CellAnalyzer:
                 The name of the file to load from.
 
         Returns:
-            None
+            CellAnalyzer instance
+                The loaded CellAnalyzer instance.
         """
         # Load the object
         with open(pkl_name, "rb") as f:
@@ -107,7 +114,7 @@ class CellAnalyzer:
         loaded_instance.__dict__.update(data)
 
         # Load the images
-        loaded_instance.img_arrays = [AICSImage(loaded_instance.df["filepath"][i]) for i in range(len(loaded_instance.df))]
+        loaded_instance.img_arrays = [AICSImage(loaded_instance.samples_df["filepath"][i]) for i in range(len(loaded_instance.samples_df))]
         # Convert to numpy array
         loaded_instance.img_arrays = [img.get_image_data("CZYX", T=0) for img in loaded_instance.img_arrays]
 
@@ -195,7 +202,7 @@ class CellAnalyzer:
         print(len(img_arrays), "images loaded")
 
         # Save in the object
-        self.df = df
+        self.samples_df = df
         self.img_arrays = img_arrays
 
         return df, img_arrays
@@ -255,11 +262,11 @@ class CellAnalyzer:
         self.projections_types = types
 
         # Save the projection types in the DataFrame
-        self.df["projection_types"] = [types for _ in range(len(self.df))]
+        self.samples_df["projection_types"] = [types for _ in range(len(self.samples_df))]
         
         return projections
         
-    def segment(self, diameter=100, channels=[0,0], log=False):
+    def segment_cells(self, diameter=100, channels=[0,0], log=False):
         """
         Segments the input image(s) into separate cells using the Cellpose model.
         If a list of images is given, each output will be a list containing the results for the images.
@@ -318,14 +325,14 @@ class CellAnalyzer:
         for i, mask in enumerate(masks):
             new_mask = mask.copy().astype("int16")
             # Add the number of cells to the DataFrame (as int)
-            self.df.at[i, "num_cells"] = new_mask.max()
+            self.samples_df.at[i, "num_cells"] = new_mask.max()
             # Make the cell IDs unique
             new_mask += prev_max
             new_mask[new_mask == prev_max] = 0
 
             # Save the cell IDs in the DataFrame
-            self.df.at[i, "cell_id_min"] = prev_max + 1
-            self.df.at[i, "cell_id_max"] = new_mask.max()
+            self.samples_df.at[i, "cell_id_min"] = prev_max + 1
+            self.samples_df.at[i, "cell_id_max"] = new_mask.max()
 
             # Set the previous max to the current max
             prev_max = new_mask.max()
@@ -334,9 +341,9 @@ class CellAnalyzer:
             new_masks.append(new_mask)
 
         # Make sure the columns are ints
-        self.df["cell_id_min"] = self.df["cell_id_min"].astype(int)
-        self.df["cell_id_max"] = self.df["cell_id_max"].astype(int)
-        self.df["num_cells"] = self.df["num_cells"].astype(int)
+        self.samples_df["cell_id_min"] = self.samples_df["cell_id_min"].astype(int)
+        self.samples_df["cell_id_max"] = self.samples_df["cell_id_max"].astype(int)
+        self.samples_df["num_cells"] = self.samples_df["num_cells"].astype(int)
 
         # Save the masks, flows, styles and denoised images in the object
         self.seg_channels = channels
@@ -359,7 +366,7 @@ class CellAnalyzer:
         """
         # Create a new DataFrame with a row for each cell
         cells_data = []
-        for i, row in self.df.iterrows():
+        for i, row in self.samples_df.iterrows():
             # Get the cell ID range for this image
             cell_id_min = row["cell_id_min"]
             cell_id_max = row["cell_id_max"]
@@ -373,8 +380,9 @@ class CellAnalyzer:
         self.cells_df = pd.DataFrame(cells_data)
         # Drop the columns that are not needed on cell level
         self.cells_df.drop(columns=["cell_id_min", "cell_id_max", "num_cells"], inplace=True)
-        # Reset the index
+        # Reset the index and set it to the cell_id
         self.cells_df.reset_index(drop=True, inplace=True)
+        self.cells_df.set_index("cell_id", inplace=True)
 
     def save_segmentation_imgs(self, folder_name="segmentations", background_channels=None, overwrite=False):
         """
@@ -412,7 +420,7 @@ class CellAnalyzer:
 
             # Save the image
             img_rgb = Image.fromarray(img_rgb)
-            img_dir = out_folder / f"{self.df['filename'][i]}_outlines.png"
+            img_dir = out_folder / f"{self.samples_df['filename'][i]}_outlines.png"
             # Check if the file already exists
             if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
@@ -434,15 +442,15 @@ class CellAnalyzer:
             
             # Save the image
             mapped = Image.fromarray(mapped)
-            img_dir = out_folder / f"{self.df['filename'][i]}_masks.png"
+            img_dir = out_folder / f"{self.samples_df['filename'][i]}_masks.png"
             # Check if the file already exists
             if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
-                mapped.save(out_folder / f"{self.df['filename'][i]}_masks.png")
+                mapped.save(out_folder / f"{self.samples_df['filename'][i]}_masks.png")
         print("Masks saved.")
 
-    def get_cell_signals(self, channels, dilate=None, mode="mean"):
+    def calculate_cell_signals(self, channels, dilate=None, mode="mean"):
         """
         Extracts the mean signal of each cell in the input image(s) based on the masks.
         Will populate the signal_means_dicts, signal_means_lists and signal_means_masks attributes.
@@ -457,8 +465,13 @@ class CellAnalyzer:
 
         Returns:
             cells_df : pd.DataFrame
-                A DataFrame with the mean signal of each cell in the image(s).
+                The cells DataFrame with the mean signal of each cell in the image(s).
+            signals_masks : dict {str: list of np.array}
+                The masks of the signals for each channel, with the same shape as the input images.
+                Keys are the channel names, values are lists of masks for each image.
         """
+        # Register the signal mode
+        self.signal_mode = mode
 
         if dilate is None:
             dilate = {name: 0 for name in channels.keys()}
@@ -512,16 +525,21 @@ class CellAnalyzer:
             self.signals_dicts[name] = signals_dicts_out
             self.signals_lists[name] = signals_lists_out
             self.signals_masks[name] = signals_masks_out
+
+        return self.cells_df, self.signals_masks
         
-    def get_bins(self, signal, thresh=None, col_name=None):
+    def bin_cell_signal(self, signal, use_log=True, thresh=None, col_name=None):
         """
         Bins the signal of each cell in the cell_df dataframe based on one or multiple thresholds.
         The bins will be called "negative" and "positive" if only one threshold is given,
         "negative", "medium" and "positive" if three thresholds are given, and will be numbered otherwise.
+        Also creates masks with the binning for each cell in the cells_df DataFrame, with the value being the bin number (0="negative" etc.)
 
         Parameters:
             signal: str
-                The name of the signal to bin. Must be a key in the signals_dicts attribute.
+                The name of the signal to bin. Must be same as used for calculate_cell_signals().
+            use_log: bool
+                Whether to use the log10 of the signal for binning.
             thresh: float, list of floats or None
                 The threshold(s) to use for binning the signal.
                 If None, Otsu's method is used on the mean signal of the cells.
@@ -529,130 +547,98 @@ class CellAnalyzer:
             col_name: str, optional
                 The name of the column to create in the cells_df DataFrame.
                 If None, the column name will be the signal name with "_bin" appended.
-        """
 
-        if signal not in self.cells_df.columns:
-            raise ValueError(f"Signal '{signal}' not found as a column of cells_df. Please run get_cell_signals() first.")
-        
+        Returns:
+            None
+        """
+        column = f'{signal}_{self.signal_mode}{"_log10" if use_log else ""}'
+
+        if column not in self.cells_df.columns:
+            raise ValueError(f"Column '{column}' not found in cells_df. Please run calculate_cell_signals() first.")
+
         if thresh is None:
-            signals = np.array(self.cells_df[signal].dropna())
+            signals = np.array(self.cells_df[column].dropna())
             # Use Otsu's method to find the threshold
             thresh = threshold_otsu(signals)
-            print(f"Using Otsu's method to find the threshold for {signal}: {thresh}")
+            print(f"Using Otsu's method to find the threshold for {column}: {thresh}")
 
         # Use thresholds if given
         if isinstance(thresh, float):
             thresh = [thresh]
             bins = ["negative", "positive"]
+            bin_nums = {"negative": 1, "positive": 2}
         else:
             thresh.sort()
-            bins = ["negative", "medium", "positive"] if len(thresh) == 2 else [i for i in range(len(thresh)+1)]
-        col_name = col_name if col_name is not None else signal + "_bin"
+            bins = ["negative", "medium", "positive"] if len(thresh) == 2 else [i+1 for i in range(len(thresh)+2)]
+            bin_nums = {bin_name: i+1 for i, bin_name in enumerate(bins)}
+        col_name = col_name if col_name is not None else signal
         self.cells_df[col_name] = bins[0]  # Initialize the column with the first bin
         for thresh, bin_name in zip(thresh, bins[1:]):
             # Set the bin for the cells that are above the threshold
-            self.cells_df.loc[self.cells_df[signal] > thresh, col_name] = bin_name
+            self.cells_df.loc[self.cells_df[column] > thresh, col_name] = bin_name
 
-    def get_pop(bins_1_in, bins_2_in, bin1_name=None, bin2_name=None):
+        # Create masks for the bins
+        bin_masks_out = []
+        for mask in self.masks:
+            bins_mask = np.zeros_like(mask, dtype=np.float32)
+            lowest_non_zero = mask[mask != 0].min()
+            for cell_id in range(lowest_non_zero, mask.max()+1):
+                cell_mask = mask == cell_id
+                cell_bin = self.cells_df.loc[self.cells_df["cell_id"] == cell_id, col_name].values[0]
+                bin_num = bin_nums[cell_bin]
+                bins_mask += bin_num * cell_mask
+            bin_masks_out.append(bins_mask)
+
+        self.bin_masks[signal] = bin_masks_out
+
+    def create_populations(self, signal1, signal2):
         """
-        Takes two sets of bins and creates a population matrix based on the unique combinations of the bins.
-        The populations are assigned in the order of the unique combinations.
-        If lists of bins are given, each output will be a list containing the results for each pair.
+        Analyzes the bins in cells_df, creates a column with the combination of the two signals (= populations).
+        The populations are named according to the first three letters of the signal names and the first three letters of the bin names.
+        Also creates RGB images for the populations in the cells_df, with the red channels for signal1 and green for signal2.
+        Further creates a DataFrame with the counts of the populations as a matrix between the two signals.
 
         Parameters:
-            bins_1_in : dict or list of dicts
-                The bins of the first variable.
-            bins_2_in : dict or list of dicts
-                The bins of the second variable.
-            bin1_name : str, optional
-                The name of the first variable.
-            bin2_name : str, optional
-                The name of the second variable.
+            signal1 : str
+                The name of the first signal to use for the population analysis. Must be according to the bins.
+            signal2 : str
+                The name of the second signal to use for the population analysis. Must be according to the bins.
 
         Returns:
-            cell_pop_dict_out : dict
-                A dictionary with the population of each cell.
-            pop_counts_out : dict
-                A dictionary with the count of each population.
-            pop_counts_df_out : pd.DataFrame
-                A DataFrame with one row, and the populations as columns.
-            pop_counts_matrix_dfs_out : pd.DataFrame
-                A DataFrame with the populations as rows and counts as columns.
-                If bin1_name and bin2_name are given, they will be used as the index and column names, respectively.
+            cells_df : pd.DataFrame
+                The cells DataFrame with the bins and populations as columns.
+            pop_imgs : list of np.array
+                The RGB images of the populations, with red channel for signal1, green for signal2 and blue = outlines.
         """
+        # Check if the signals are in the cells_df
+        if signal1 not in self.cells_df.columns or signal2 not in self.cells_df.columns:
+            raise ValueError(f"Signals '{signal1}' and/or '{signal2}' not found in cells_df. Please run calculate_cell_signals() and bin_cell_signal() first.")
 
-        if not isinstance(bins_1_in, list):
-            bins_1_list = [bins_1_in]
-            bins_2_list = [bins_2_in]
-        else:
-            bins_1_list = bins_1_in
-            bins_2_list = bins_2_in
-        
-        if not len(bins_1_list) == len(bins_2_list):
-            raise ValueError('Length of both bins dicts must be the same.')
-        
-        cell_pop_dicts_out = []
-        pop_counts_out = []
-        pop_counts_df_out = []
-        pop_counts_matrix_dfs_out = []
+        # Create a new column for the population, and temp columns
+        pop_col_name = "population"
+        self.cells_df["temp_signal1"] = signal1[:3]  # First three letters of signal1
+        self.cells_df["temp_signal2"] = signal2[:3]  # First three letters of signal2
+        # Create the population column by combining the two signals
+        self.cells_df[pop_col_name] = self.cells_df["temp_signal1"] + "_" + self.cells_df[signal1].str.slice(0,3) + "_" + self.cells_df["temp_signal2"] + "_" + self.cells_df[signal2].str.slice(0,3)
+        # Drop the temporary columns
+        self.cells_df.drop(columns=["temp_signal1", "temp_signal2"], inplace=True)
+        # Make sure the column is a string
+        self.cells_df[pop_col_name] = self.cells_df[pop_col_name].astype(str)
 
-        for bins_1, bins_2 in zip(bins_1_list, bins_2_list):
-            # Get the unique values from bins_1 and bins_2
-            bins_1_vals = set(bins_1.values())
-            bins_2_vals = set(bins_2.values())
-            # Initialize the dictionary to store the population for each cell
-            cell_pop_dict = {}
-            # Populate the cell_pop_dict based on bin values
-            for cell_id in bins_1.keys():
-                pop_bin = 1
-                for bin1_val in bins_1_vals:
-                    for bin2_val in bins_2_vals:
-                        if bins_1[cell_id] == bin1_val and bins_2[cell_id] == bin2_val:            
-                            cell_pop_dict[cell_id] = pop_bin
-                        pop_bin += 1
+        # Create RGB images for the populations
+        signal1_bin_nums = {bin_name: i for i, bin_name in enumerate(self.cells_df[signal1].unique())}
+        signal2_bin_nums = {bin_name: i for i, bin_name in enumerate(self.cells_df[signal2].unique())}
+        pop_imgs_out = []
+        for mask1, mask2, outline in zip(self.bin_masks[signal1], self.bin_masks[signal2], self.outlines):
+            img_rgb = np.zeros((*mask1.shape, 3), dtype=np.uint8)
+            img_rgb[:, :, 0] = mask1 * 255 // (len(signal1_bin_nums))  # Scale to 0-255
+            img_rgb[:, :, 1] = mask2 * 255 // (len(signal2_bin_nums))  # Scale to 0-255
+            # Add the outlines as the blue channel
+            img_rgb[:, :, 2] = outline * 255  # Set blue channel to 255 where the cell outlines are
+            pop_imgs_out.append(img_rgb)
+        self.pop_imgs = pop_imgs_out
 
-            # populations = set(cell_pop_dict.values())
-            populations = range(1, len(bins_1_vals)*len(bins_2_vals)+1)
-            pop_counts = {pop: len([id for id in cell_pop_dict if cell_pop_dict[id]==pop]) for pop in populations}
-            pop_counts_df = pd.DataFrame(pop_counts, index=[0])
-            # NOTE: This naming is not flexible for bin numbers other than 2
-            if bin1_name is not None and bin2_name is not None:
-                pop_counts_df.columns = ["non-" + bin1_name + " & " + "non-" + bin2_name,
-                                            "non-" + bin1_name + " & " + bin2_name,
-                                            bin1_name + " & " + "non-" + bin2_name,
-                                            bin1_name + " & " + bin2_name
-                                            ]
-
-            # Create a df with the populations and counts, putting bins_1 in rows and bins_2 in columns
-            dict_for_df = {}
-            pop_bin = 1
-            for bin1_val in bins_1_vals:
-                row = {}
-                for bin2_val in bins_2_vals:
-                    if pop_bin in pop_counts:
-                        row[bin2_val] = pop_counts[pop_bin]
-                    pop_bin += 1
-                dict_for_df[bin1_val] = row
-            # Create the df, make sure to fill by row
-            pop_counts_matrix_df = pd.DataFrame(dict_for_df).T
-            if bin1_name is not None:
-                pop_counts_matrix_df.index.name = bin1_name
-            if bin2_name is not None:
-                pop_counts_matrix_df.columns.name = bin2_name
-            
-            cell_pop_dicts_out.append(cell_pop_dict)
-            pop_counts_out.append(pop_counts)
-            pop_counts_df_out.append(pop_counts_df)
-            pop_counts_matrix_dfs_out.append(pop_counts_matrix_df)
-
-        # return single values if only one image
-        if not isinstance(bins_1_in, list):
-            cell_pop_dicts_out = cell_pop_dicts_out[0]
-            pop_counts_out = pop_counts_out[0]
-            pop_counts_df_out = pop_counts_df_out[0]
-            pop_counts_matrix_dfs_out = pop_counts_matrix_dfs_out[0]
-        
-        return cell_pop_dicts_out, pop_counts_out, pop_counts_df_out, pop_counts_matrix_dfs_out
+        return self.cells_df, pop_imgs_out
 
     def get_sep_rel_pop_counts_df(pop_counts_df, bin1_name=None, bin2_name=None):
         """
@@ -700,49 +686,6 @@ class CellAnalyzer:
         rel = {keys[0]: df_1_rel, keys[1]: df_2_rel}
 
         return abs, rel
-
-    def get_pop_mask(cell_pop_dicts_in, cell_masks_in):
-        """
-        Assign the population of each cell to the pixels in the cell mask.
-        If lists of dictionaries and masks are given, the output will be a list containing the results for each pair.
-
-        Parameters:
-            cell_pop_dict : dict or list of dicts
-                A dictionary with the population of each cell.
-            cell_mask : np.array or list of np.arrays
-                An image containing the masks of the cells in the image.
-
-        Returns:
-            pop_masks : np.array
-                An image in which, for each cell, the population is assigned to its pixels
-        """
-
-        if not isinstance(cell_pop_dicts_in, list):
-            cell_pop_dicts = [cell_pop_dicts_in]
-            cell_masks = [cell_masks_in]
-        else:
-            cell_pop_dicts = cell_pop_dicts_in
-            cell_masks = cell_masks_in
-
-        if not len(cell_pop_dicts) == len(cell_masks):
-            raise ValueError('Length of cell_pop_dicts and cell_masks must be the same.')
-
-        pop_masks = []
-        for cell_pop_dict, cell_mask in zip(cell_pop_dicts, cell_masks):
-            
-            pop_mask = np.zeros_like(cell_mask, dtype=np.int32)
-
-            for cell_id in cell_pop_dict.keys():
-                single_cell_mask = cell_mask == cell_id
-                pop = cell_pop_dict[cell_id]
-                pop_mask += pop * single_cell_mask
-            pop_mask = pop_mask.astype(np.uint8)
-            pop_masks.append(pop_mask)
-
-        if not isinstance(cell_pop_dicts_in, list):
-            pop_masks = pop_masks[0]
-
-        return pop_masks
         
 
     ### HELPER FUNCTIONS ###
