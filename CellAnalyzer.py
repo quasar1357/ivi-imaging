@@ -35,7 +35,6 @@ class CellAnalyzer:
         self.cells_df = None
         self.signal_mode = "mean"  # Default mode for signal calculation
         self.bin_masks = {}
-        self.pop_imgs = []
 
         # Load cellpose model
         self.load_cellpose_model()
@@ -65,12 +64,12 @@ class CellAnalyzer:
         if self.samples_df is not None:
             self.samples_df.to_csv(output_path / "metadata.csv", index=False)
         if self.cells_df is not None:
-            self.cells_df.to_csv(output_path / "cells_metadata.csv", index=False)
+            self.cells_df.to_csv(output_path / "metadata_cells.csv", index=False)
 
         # Save the object
         data_to_save = {
             'path': self.path,
-            'df': self.samples_df,
+            'samples_df': self.samples_df,
             'projections': self.projections,
             'projections_types': self.projections_types,
             'seg_channels': self.seg_channels,
@@ -85,8 +84,7 @@ class CellAnalyzer:
             'signals_masks': self.signals_masks,
             'cells_df': self.cells_df,
             'signal_mode': self.signal_mode,
-            'bin_masks': self.bin_masks,
-            'pop_imgs': self.pop_imgs
+            'bin_masks': self.bin_masks
         }
 
         with open(output_path / "CellAnalyzer.pkl", "wb") as f:
@@ -113,7 +111,7 @@ class CellAnalyzer:
         # Update the instance with the loaded data
         loaded_instance.__dict__.update(data)
 
-        # Load the images
+        # Load the image
         loaded_instance.img_arrays = [AICSImage(loaded_instance.samples_df["filepath"][i]) for i in range(len(loaded_instance.samples_df))]
         # Convert to numpy array
         loaded_instance.img_arrays = [img.get_image_data("CZYX", T=0) for img in loaded_instance.img_arrays]
@@ -390,9 +388,6 @@ class CellAnalyzer:
         """
         # Save the masks, flows, styles and denoised images
         out_folder = self.path / folder_name
-        # Check if the folder already exists
-        # if out_folder.exists():
-        #     raise ValueError(f"Folder {folder_name} already exists. Please choose a different name.")
         # Create the folder if it doesn't exist
         out_folder.mkdir(parents=True, exist_ok=True)
 
@@ -415,8 +410,8 @@ class CellAnalyzer:
                 channel = np.clip(channel, 0, 255)
                 channel = channel.astype(np.uint8)
                 img_rgb[:, :, c] = channel  # Copy existing channels
-            # Add the outlines as the blue channel
-            img_rgb[outline > 0, 2] = 255
+            # Add white outlines
+            img_rgb[outline > 0] = [255, 255, 255]  # Set the outline channel to white
 
             # Save the image
             img_rgb = Image.fromarray(img_rgb)
@@ -426,7 +421,7 @@ class CellAnalyzer:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
                 img_rgb.save(img_dir)
-        print("Outlines saved.")
+        print(i+1, "outlines saved.")
         
         # MASKS
         for i, mask in enumerate(self.masks):
@@ -448,7 +443,7 @@ class CellAnalyzer:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
                 mapped.save(out_folder / f"{self.samples_df['filename'][i]}_masks.png")
-        print("Masks saved.")
+        print(i+1, "masks saved.")
 
     def calculate_cell_signals(self, channels, dilate=None, mode="mean"):
         """
@@ -458,7 +453,7 @@ class CellAnalyzer:
         Parameters:
             channels : dict {str: int}
                 Name and position of the channels to use for the mean signal calculation.
-            dilate : list of int
+            dilate : dict {str: int} or int, optional
                 The amount of dilation to apply to the masks before calculating the mean signal.
                 One value per each channel.
                 If negative, erosion is applied instead of dilation.
@@ -480,6 +475,7 @@ class CellAnalyzer:
         elif not all([k in channels.keys() for k in dilate.keys()]):
             raise ValueError('dilate must be a list of the same length as channels, or a single int for all channels.')
 
+        cells_df = self.cells_df.copy()
         for name, num in channels.items():
             # Reduce the channel number by one (0-indexed)
             num -= 1
@@ -514,9 +510,9 @@ class CellAnalyzer:
                     img_signals_mask += cell_signal * cell_mask
 
                     # Add the signal to the cell_df
-                    self.cells_df.loc[self.cells_df["cell_id"] == cell_id, name+"_"+mode] = cell_signal
+                    cells_df.loc[cell_id, name+"_"+mode] = cell_signal
                     # Also add the log10 of the signal
-                    self.cells_df.loc[self.cells_df["cell_id"] == cell_id, name+"_"+mode+"_log10"] = np.log10(cell_signal) if cell_signal > 0 else 0
+                    cells_df.loc[cell_id, name+"_"+mode+"_log10"] = np.log10(cell_signal) if cell_signal > 0 else 0
 
                 signals_dicts_out.append(img_signals_dict)
                 signals_lists_out.append(img_signals_list)
@@ -526,7 +522,10 @@ class CellAnalyzer:
             self.signals_lists[name] = signals_lists_out
             self.signals_masks[name] = signals_masks_out
 
-        return self.cells_df, self.signals_masks
+        # Save the cells_df in the object
+        self.cells_df = cells_df
+
+        return cells_df, self.signals_masks
         
     def bin_cell_signal(self, signal, use_log=True, thresh=None, col_name=None):
         """
@@ -565,11 +564,12 @@ class CellAnalyzer:
         # Use thresholds if given
         if isinstance(thresh, float):
             thresh = [thresh]
+        if len(thresh) == 1:
             bins = ["negative", "positive"]
             bin_nums = {"negative": 1, "positive": 2}
         else:
             thresh.sort()
-            bins = ["negative", "medium", "positive"] if len(thresh) == 2 else [i+1 for i in range(len(thresh)+2)]
+            bins = ["negative", "partial", "positive"] if len(thresh) == 2 else [i+1 for i in range(len(thresh)+2)]
             bin_nums = {bin_name: i+1 for i, bin_name in enumerate(bins)}
         col_name = col_name if col_name is not None else signal
         self.cells_df[col_name] = bins[0]  # Initialize the column with the first bin
@@ -584,7 +584,7 @@ class CellAnalyzer:
             lowest_non_zero = mask[mask != 0].min()
             for cell_id in range(lowest_non_zero, mask.max()+1):
                 cell_mask = mask == cell_id
-                cell_bin = self.cells_df.loc[self.cells_df["cell_id"] == cell_id, col_name].values[0]
+                cell_bin = self.cells_df.loc[cell_id, col_name]
                 bin_num = bin_nums[cell_bin]
                 bins_mask += bin_num * cell_mask
             bin_masks_out.append(bins_mask)
@@ -607,15 +607,13 @@ class CellAnalyzer:
         Returns:
             cells_df : pd.DataFrame
                 The cells DataFrame with the bins and populations as columns.
-            pop_imgs : list of np.array
-                The RGB images of the populations, with red channel for signal1, green for signal2 and blue = outlines.
         """
         # Check if the signals are in the cells_df
         if signal1 not in self.cells_df.columns or signal2 not in self.cells_df.columns:
             raise ValueError(f"Signals '{signal1}' and/or '{signal2}' not found in cells_df. Please run calculate_cell_signals() and bin_cell_signal() first.")
 
         # Create a new column for the population, and temp columns
-        pop_col_name = "population"
+        pop_col_name = signal1[:3] + "_" + signal2[:3] + "_pop"
         self.cells_df["temp_signal1"] = signal1[:3]  # First three letters of signal1
         self.cells_df["temp_signal2"] = signal2[:3]  # First three letters of signal2
         # Create the population column by combining the two signals
@@ -625,20 +623,50 @@ class CellAnalyzer:
         # Make sure the column is a string
         self.cells_df[pop_col_name] = self.cells_df[pop_col_name].astype(str)
 
+        return self.cells_df
+    
+    def save_population_imgs(self, signal1, signal2, outline_channel="white", folder_name="populations", overwrite=False):
+        
+        # Define output folder
+        pop_name = signal1[:3] + "_" + signal2[:3] + "_pop"
+        out_folder = self.path / folder_name / pop_name
+        # Create the folder if it doesn't exist
+        out_folder.mkdir(parents=True, exist_ok=True)
+
+        # Define the channels
+        outline_channel = {"blue": 2, "green": 1, "red": 0, "white": None}.get(outline_channel.lower(), None)  # Default to white if not recognized
+        channel1 = 0 if outline_channel != 0 else 1  # Use the red for signal1 if outline is not already defined as red
+        channel2 = 1 if (outline_channel != 0 and outline_channel != 1) else 2
+
         # Create RGB images for the populations
         signal1_bin_nums = {bin_name: i for i, bin_name in enumerate(self.cells_df[signal1].unique())}
         signal2_bin_nums = {bin_name: i for i, bin_name in enumerate(self.cells_df[signal2].unique())}
-        pop_imgs_out = []
+        i = 0
         for mask1, mask2, outline in zip(self.bin_masks[signal1], self.bin_masks[signal2], self.outlines):
             img_rgb = np.zeros((*mask1.shape, 3), dtype=np.uint8)
-            img_rgb[:, :, 0] = mask1 * 255 // (len(signal1_bin_nums))  # Scale to 0-255
-            img_rgb[:, :, 1] = mask2 * 255 // (len(signal2_bin_nums))  # Scale to 0-255
-            # Add the outlines as the blue channel
-            img_rgb[:, :, 2] = outline * 255  # Set blue channel to 255 where the cell outlines are
-            pop_imgs_out.append(img_rgb)
-        self.pop_imgs = pop_imgs_out
+            img_rgb[:, :, channel1] = mask1 * 255 // (len(signal1_bin_nums))  # Scale to 0-255
+            img_rgb[:, :, channel2] = mask2 * 255 // (len(signal2_bin_nums))  # Scale to 0-255
+            # Add the outlines as the chosen channel
+            # outline = morphology.binary_dilation(outline, morphology.disk(1.5))
+            img_rgb[outline] = [255, 255, 255] if outline_channel is None else [0, 0, 0]  # Set the outline channel to white or the specified color
+            if outline_channel is not None:
+                img_rgb[:, :, outline_channel] = outline * 255
 
-        return self.cells_df, pop_imgs_out
+            # Save the image
+            img_rgb = Image.fromarray(img_rgb)
+            img_dir = out_folder / f"{self.samples_df['filename'][i]}_{pop_name}.png"
+            # Check if the file already exists
+            if img_dir.exists() and not overwrite:
+                print(f"File {img_dir} already exists. Saving this file was skipped.")
+            else:
+                img_rgb.save(img_dir)
+            
+            i += 1
+        print(i, "populations saved.")
+
+
+#####################################################################################
+
 
     def get_sep_rel_pop_counts_df(pop_counts_df, bin1_name=None, bin2_name=None):
         """
