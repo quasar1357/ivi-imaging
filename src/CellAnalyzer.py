@@ -694,7 +694,6 @@ class CellAnalyzer:
 
         return cells_df, signal_masks_out
 
-
     def calculate_cell_signals(self, channels, dilate=None, mode="mean"):
         """Extracts the mean signal of each cell in the input image(s) for multiple channels based on the masks.
         Will populate the signal_dicts, signal_lists and signal_masks attributes.
