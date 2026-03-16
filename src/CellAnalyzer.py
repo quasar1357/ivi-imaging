@@ -542,7 +542,7 @@ class CellAnalyzer:
                 else:
                     print(
                         f"Status: {n_seg_done_before}/{n_imgs_total} segmented, {n_projected}/{n_imgs_total} projected."
-                        "\nNothing was changed. Use overwrite=True to start a new segmentation round."
+                        "\nNothing was changed. Use overwrite=True to start a new segmentation round. Or run create_cells_df() if there was an error during creation of cells_df."
                     )
             return self.masks, self.flows, self.styles, self.imgs_dn, self.outlines
 
@@ -691,7 +691,7 @@ class CellAnalyzer:
                 # new_row["cell_area_px"] = cell_area
                 # Calculate the neighbours of the cell
                 if calculate_neighbours:
-                    num_neighbours = self.count_surrounding_cells(mask, cell_id, expected_diameter=self.seg_diameter)
+                    num_neighbours = self.count_surrounding_cells(mask, cell_id) #, expected_diameter=self.seg_diameter)
                     new_row["num_neighbours"] = int(num_neighbours)
                 # Append the new row to the list
                 cells_data.append(new_row)
