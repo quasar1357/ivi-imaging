@@ -3,7 +3,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from cellpose import core, denoise, io, utils
 from skimage import morphology
-from skimage.measure import regionprops
+from skimage.measure import regionprops, regionprops_table
 from skimage.filters import threshold_otsu
 import pandas as pd
 import seaborn as sns
@@ -12,7 +12,7 @@ import itertools
 import re
 from aicsimageio import AICSImage
 import pickle
-
+from tifffile.tifffile import imwrite
 
 class CellAnalyzer:
     
@@ -31,14 +31,14 @@ class CellAnalyzer:
         self.styles = None
         self.imgs_dn = None
         self.outlines = None
-        self.signal_dicts = {}
-        self.signal_lists = {}
-        self.signal_masks = {}
         self.cells_df = None
+        self.signals = {}
+        # self.signal_lists = {}
+        self.signal_masks = {}
         self.signal_mode = {}
-        self.bin_masks = {}
         self.bins = {}
-        self.cfg_df = None
+        self.bin_masks = {}
+        self.channels_df = None
 
         # Load cellpose model
         self.load_cellpose_model()
@@ -69,8 +69,8 @@ class CellAnalyzer:
             self.samples_df.to_csv(output_path / "metadata.csv", index=False)
         if self.cells_df is not None:
             self.cells_df.to_csv(output_path / "metadata_cells.csv", index=False)
-        if self.cfg_df is not None:
-            self.cfg_df.to_csv(output_path / "metadata_cfg.csv", index=False)
+        if self.channels_df is not None:
+            self.channels_df.to_csv(output_path / "metadata_cfg.csv", index=False)
 
         # Save the object
         data_to_save = {
@@ -85,21 +85,21 @@ class CellAnalyzer:
             'styles': self.styles,
             # 'imgs_dn': self.imgs_dn,
             'outlines': self.outlines,
-            'signal_means_dicts': self.signal_dicts,
-            'signal_lists': self.signal_lists,
-            'signal_masks': self.signal_masks,
             'cells_df': self.cells_df,
+            'signals': self.signals,
+            # 'signal_lists': self.signal_lists,
+            'signal_masks': self.signal_masks,
             'signal_mode': self.signal_mode,
-            'bin_masks': self.bin_masks,
             'bins': self.bins,
-            'cfg_df': self.cfg_df
+            'bin_masks': self.bin_masks,
+            'channels_df': self.channels_df
         }
 
         with open(output_path / "CellAnalyzer.pkl", "wb") as f:
             pickle.dump(data_to_save, f)
 
     @staticmethod
-    def load(pkl_name=None, use_GPU=True, load_images=False):
+    def load(pkl_name=None, load_images=False):
         """
         Loads the object from a pickle file.
         
@@ -140,7 +140,7 @@ class CellAnalyzer:
 
         # Return the loaded instance
         return loaded_instance
-    
+
     def load_cellpose_model(self):
         # Initializations for Cellpose
         use_GPU = core.use_gpu()
@@ -150,21 +150,31 @@ class CellAnalyzer:
         # Define the model globally
         self.cellpose_model = denoise.CellposeDenoiseModel(gpu=use_GPU, model_type="cyto3",
                                             restore_type="denoise_cyto3")
-        
-    def read_data(self, parsing_settings="ALI"):
+
+    def read_data(self, parsing_settings="ALI",
+                  regex_pattern=None, date_format=None, file_extension=None):
         """
         Parses structured microscopy .dv filenames from a given folder and returns a DataFrame
         with extracted metadata.
         Takes the path from the class initialization. Saves the DataFrame and image arrays in the object.
-        
+
         Parameters:
             parsing_settings : str, optional
-                The parsing settings to use. Options are "ALI" (default) or "jinglecells".
+                The parsing settings to use. Options are "ALI" (default), "jinglecells", or "custom".
                 "ALI" expects filenames in the format:
-                <prefix>_<condition>_<temp>_<host>_<donor>_<mag>_<time>_<date>_<sample>.nd2
+                    <prefix>_<condition>_<temp>_<host>_<donor>_<mag>_<time>_<date>_<sample>.nd2
                 "jinglecells" expects filenames in the format:
-                <condition>_<donor>_<time>_<date>.<sample>_<mode1>_<mode2>.dv
-        
+                    <condition>_<donor>_<time>_<date>.<sample>_<mode1>_<mode2>.dv
+                If "custom" is chosen, the regex pattern, date format and file extension must be given as arguments as well.
+            regex_pattern : str, optional
+                The regex pattern to use for parsing the filenames. Only needed if parsing_settings is "custom".
+            date_format : str, optional
+                The date format to use for parsing the date in the filenames. Only needed if parsing_settings is "custom".
+                Examples: "%y.%m.%d" for "23.05.01", "%Y%m%d" for "20230501", "%d-%m-%Y" for "01-05-2023".
+            file_extension : str, optional
+                The file extension to look for in the filenames. Only needed if parsing_settings is "custom".
+                Examples: ".dv", ".nd2", ".tif".
+
         Returns:
             pd.DataFrame, np.array:
                 DataFrame containing extracted metadata from filenames
@@ -172,6 +182,12 @@ class CellAnalyzer:
         """
         input_path = self.path
 
+        checks = [regex_pattern is not None, date_format is not None, file_extension is not None]
+        if any(checks) and parsing_settings != "custom":
+            raise ValueError("regex_pattern, date_format and file_extension should only be provided if parsing_settings is 'custom'.")
+        if parsing_settings == "custom" and not all(checks):
+            raise ValueError("For 'custom' parsing, all of regex_pattern, date_format, and file_extension must be provided.")
+        
         # Regex pattern to extract components
         if parsing_settings=="jinglecells":
             file_extension = ".dv"
@@ -185,7 +201,7 @@ class CellAnalyzer:
             r'(?P<mode1>[A-Z0-9]+)_'
             r'(?P<mode2>[A-Z0-9]+)\.dv$'
             )
-        else:
+        elif parsing_settings=="ALI":
             file_extension = ".nd2"
             date_format = "%Y%m%d"
             pattern = re.compile(
@@ -199,6 +215,14 @@ class CellAnalyzer:
                 r'(?P<date>\d{8})_'              # YYYYMMDD format
                 r'(?P<sample>\d+)\.nd2$'
             )
+        elif parsing_settings=="custom":
+            if not all([regex_pattern, date_format, file_extension]):
+                raise ValueError("For 'custom' parsing, all of regex_pattern, date_format, and file_extension must be provided.")
+            pattern = re.compile(regex_pattern)
+        
+        self.file_extension = file_extension
+        self.date_format = date_format
+        self.regex_pattern = regex_pattern
 
         filenames = list(input_path.glob(f"*{file_extension}"))
 
@@ -254,9 +278,11 @@ class CellAnalyzer:
 
         return df, img_arrays
 
-    def create_projections(self, types=["max","max","max","max"], c_axis=0, z_axis=1):
+    def create_projections(self, types=["max","max","max","max"], c_axis=0, z_axis=1, num_imgs=None, overwrite=False):
         """
         Creates projections of all channels of the images in the image list.
+        Skips images that already have a projection unless overwrite=True.
+        Tracks progress in samples_df["has_projection"].
         
         Parameters:
             types : list of str
@@ -266,70 +292,114 @@ class CellAnalyzer:
                 The axis of the channels in the image arrays. Default is 0 (CZYX).
             z_axis : int
                 The axis of the z-dimension in the image arrays. Default is 1 (CZYX).
+            num_imgs : int
+                The maximum number of new projections to create. Default is None (all remaining images).
+            overwrite : bool
+                If True, re-project all images, discarding existing projections. Required when changing types. Default is False.
 
         Returns:
-            projections : np.array or list of np.arrays
-                The projections of the images.
+            projections : list of np.arrays
+                The projections of the images (may contain None for images not yet projected).
         """
+        # Check if images are loaded
+        if self.img_arrays is None:
+            raise ValueError("Image arrays are empty. Please run read_data() first, or load existing instance with `.load(..., load_images=True)`.")
         # Check if the axis indices are valid
         if c_axis < 0 or c_axis > 3 or z_axis < 0 or z_axis > 3 or c_axis == z_axis:
             raise ValueError("Axis indices must be between 0 and 3 and different from each other.")
-
         # Test number channels
         num_channels = self.img_arrays[0].shape[c_axis]
         if len(types) != num_channels:
             raise ValueError(f"Number of types ({len(types)}) does not match number of channels ({num_channels}).")
 
-        # Create projections
-        projections = []
-        for img in self.img_arrays:
+        # Handle existing projections / type conflicts
+        prev_proj = 0 if self.projections is None else sum([p is not None for p in self.projections])
+        if overwrite and prev_proj > 0:
+            print(f"Creating projections with overwrite=True: resetting projections ({prev_proj}/{len(self.img_arrays)} images had projections). Starting a new projection round.")
+            if self.projections_types is not None and self.projections_types != types:
+                print(f"Projection types changed from {self.projections_types} to {types}.")
+                print("\nWarning: if you have already performed downstream analysis, these might now be inconsistent with the new projections. Consider re-running those steps as well.")
+            self.projections = [None] * len(self.img_arrays)
+            self.samples_df["has_projection"] = False
+        elif self.projections_types is not None and self.projections_types != types:
+            raise ValueError(
+                f"Projection types {types} differ from existing {self.projections_types}. "
+                "Use overwrite=True to replace all projections with the new types."
+            )
+
+        # Initialize projection list and derive tracking from it (single source of truth)
+        if self.projections is None:
+            self.projections = [None] * len(self.img_arrays)
+        elif len(self.projections) != len(self.img_arrays):
+            raise ValueError(
+                "Length mismatch between projections and image arrays. "
+                "Use overwrite=True in create_projections() to start a clean projection round."
+            )
+        self.samples_df["has_projection"] = [p is not None for p in self.projections]
+
+        # Determine which images still need projections
+        pending = self.samples_df.index[~self.samples_df["has_projection"]].tolist()
+        n_done_before = int(self.samples_df["has_projection"].sum())
+        n_pending_before = len(pending)
+
+        if not pending:
+            print(f"Projection status: {n_done_before}/{len(self.img_arrays)} images already have projections. Nothing was changed. Use overwrite=True to start a new projection round.")
+            return self.projections
+
+        if num_imgs is not None:
+            pending = pending[:num_imgs]
+
+        print(
+            f"Creating projections for {len(pending)} image(s). "
+            f"Status before this run: {n_done_before}/{len(self.img_arrays)}."
+        )
+
+        # z_axis shifts by -1 after channel extraction if it came after c_axis
+        _z_axis = z_axis - 1 if z_axis > c_axis else z_axis
+
+        # Create projections for pending images
+        for idx in pending:
+            img = self.img_arrays[idx]
             img_projections = []
             for i in range(img.shape[c_axis]):
                 # Get the projection type for the current channel
                 proj_type = types[i]
-                # Get channel
                 img_channel = np.take(img, indices=i, axis=c_axis)
-                # If the z_axis was behind the c_axis, it was moved one forward when extracting the channel
-                if z_axis > c_axis:
-                    z_axis -= 1
-                # Create the projection
                 if proj_type == "max":
-                    proj = np.max(img_channel, axis=z_axis)
+                    proj = np.max(img_channel, axis=_z_axis)
                 elif proj_type == "min":
-                    proj = np.min(img_channel, axis=z_axis)
+                    proj = np.min(img_channel, axis=_z_axis)
                 elif proj_type == "mean":
-                    proj = np.mean(img_channel, axis=z_axis)
+                    proj = np.mean(img_channel, axis=_z_axis)
                 elif proj_type == "median":
-                    proj = np.median(img_channel, axis=z_axis)
+                    proj = np.median(img_channel, axis=_z_axis)
                 elif proj_type == "sum":
-                    proj = np.sum(img_channel, axis=z_axis)
+                    proj = np.sum(img_channel, axis=_z_axis)
                 elif "perc_" in proj_type:
                     perc = int(proj_type.split("_")[-1])
-                    proj = np.percentile(img_channel, perc, axis=z_axis)
+                    proj = np.percentile(img_channel, perc, axis=_z_axis)
                 else:
-                    raise ValueError(f"Projection type '{proj_type}' not recognized. Use 'sum', 'max', 'min', or 'mean'.")  
-                # Append the projection to the list
+                    raise ValueError(f"Projection type '{proj_type}' not recognized. Use 'sum', 'max', 'min', or 'mean'.")
                 img_projections.append(proj)
-                
-            # Stack the projections along the channel axis
-            img_projections = np.stack(img_projections, axis=c_axis)
-            # Append the projections to the list
-            projections.append(img_projections)
 
-        # Save in the object
-        self.projections = projections
+            self.projections[idx] = np.stack(img_projections, axis=c_axis)
+            self.samples_df.at[idx, "has_projection"] = True
+
+        n_done = int(self.samples_df["has_projection"].sum())
+        print(f"{len(pending)} projection(s) created. Status after this run: {n_done}/{len(self.img_arrays)}.")
+
+        # Save the projection types
         self.projections_types = types
 
-        # Save the projection types in the DataFrame
-        # self.samples_df["projection_types"] = [types for _ in range(len(self.samples_df))]
-        if self.cfg_df is None:
-            self.cfg_df = pd.DataFrame({"projection": types})
+        # Save the projection types in channels_df
+        if self.channels_df is None:
+            self.channels_df = pd.DataFrame({"projection": types})
         else:
-            self.cfg_df["projection"] = types
+            self.channels_df["projection"] = types
+
+        return self.projections
         
-        return projections
-        
-    def segment_cells(self, diameter=100, channels=[0,0], log=False, calculate_neighbours=True):
+    def segment_cells(self, diameter=100, channels=[0,0], log=False, calculate_neighbours=True, num_imgs=None, overwrite=False):
         """
         Segments the input image(s) into separate cells using the Cellpose model.
         If a list of images is given, each output will be a list containing the results for the images.
@@ -343,6 +413,11 @@ class CellAnalyzer:
                 The channels to use for the segmentation. Details see below.
             log : bool
                 Whether to log the output of the Cellpose model.
+            num_imgs : int
+                The maximum number of images to segment in this run. Default is None (all eligible images).
+            overwrite : bool
+                If True, clears existing segmentation and re-runs from scratch with the current diameter/channels.
+                If False, changing diameter/channels is not allowed.
 
         Returns:
             masks : np.array or list of np.arrays
@@ -375,91 +450,245 @@ class CellAnalyzer:
             diameter can be a list or a single number for all images
         """
 
-        img_list = self.projections
-        diam_list = [diameter]*len(img_list)
+        # Basic checks
+        if self.samples_df is None:
+            raise ValueError("samples_df is empty. Please run read_data() first.")
+        if self.projections is None:
+            raise ValueError("projections are empty. Please run create_projections() first.")
+
+        n_imgs_total = len(self.samples_df)
+
+        # Derive tracking from current data structures (single source of truth)
+        if len(self.projections) != n_imgs_total:
+            raise ValueError(
+                "Length mismatch between projections and samples_df. "
+                "Please align data or re-run create_projections()."
+            )
+        self.samples_df["has_projection"] = [p is not None for p in self.projections] # Refresh projection tracking in case it got out of sync
+        if self.masks is None:
+            self.samples_df["has_segmentation"] = False # Set to False for all rows if masks not initialized yet
+        elif len(self.masks) != n_imgs_total:
+            raise ValueError(
+                "Length mismatch between masks and samples_df. "
+                "Use overwrite=True in segment_cells() to start a clean segmentation round."
+            )
+        else:
+            self.samples_df["has_segmentation"] = [m is not None for m in self.masks]
+
+        # Handle parameter consistency or reset segmentation (if overwrite=True)
+        if overwrite:
+            prev_seg = int(self.samples_df["has_segmentation"].sum()) if "has_segmentation" in self.samples_df.columns else 0
+            if prev_seg > 0:
+                print(f"Using overwrite=True: resetting segmentation ({prev_seg}/{n_imgs_total} images had segmentation). Starting a new segmentation round.")
+            if (self.seg_diameter is not None and self.seg_diameter != diameter) or (self.seg_channels is not None and self.seg_channels != channels):
+                print(f"You changed segmentation parameters (diameter and/or channels).")
+                print("\nWarning: if you have already performed downstream analysis, these might now be inconsistent with the new segmentations. Consider re-running those steps as well.")
+            self.masks = [None] * n_imgs_total
+            self.flows = [None] * n_imgs_total
+            self.styles = [None] * n_imgs_total
+            self.imgs_dn = [None] * n_imgs_total
+            self.outlines = [None] * n_imgs_total
+            self.cells_df = None
+            self.samples_df["has_segmentation"] = False
+            for col in ["cell_id_min", "cell_id_max", "num_cells"]:
+                self.samples_df[col] = pd.NA
+        else:
+            if self.seg_channels is not None and self.seg_channels != channels:
+                raise ValueError(
+                    f"Segmentation channels {channels} differ from existing {self.seg_channels}. "
+                    "Use overwrite=True to replace all segmentation results with the new channels."
+                )
+            if self.seg_diameter is not None and self.seg_diameter != diameter:
+                raise ValueError(
+                    f"Segmentation diameter {diameter} differs from existing {self.seg_diameter}. "
+                    "Use overwrite=True to replace all segmentation results with the new diameter."
+                )
+
+        # Initialize segmentation containers if needed
+        if self.masks is None:
+            self.masks = [None] * n_imgs_total
+        if self.flows is None:
+            self.flows = [None] * n_imgs_total
+        if self.styles is None:
+            self.styles = [None] * n_imgs_total
+        if self.imgs_dn is None:
+            self.imgs_dn = [None] * n_imgs_total
+        if self.outlines is None:
+            self.outlines = [None] * n_imgs_total
+
+        # Keep tracking aligned with current masks
+        self.samples_df["has_segmentation"] = [m is not None for m in self.masks]
+
+        # Segment only images that have projections and are not segmented yet
+        pending = self.samples_df.index[
+            (self.samples_df["has_projection"]) & (~self.samples_df["has_segmentation"])
+        ].tolist()
+        pending = [idx for idx in pending if self.projections[idx] is not None]
+        n_seg_done_before = int(self.samples_df["has_segmentation"].sum())
+        n_projected = int(self.samples_df["has_projection"].sum())
+        n_unprojected = n_imgs_total - n_projected
+
+        if not pending:
+            if overwrite:
+                print("No images pending for segmentation (no projected images available to segment in this run). Segmentation state was reset because overwrite=True.")
+            else:
+                if n_projected > 0 and n_seg_done_before == n_projected and n_projected < n_imgs_total:
+                    print(
+                        f"All projected images are already segmented ({n_projected}/{n_imgs_total}), but {n_unprojected} image(s) still have no projections. "
+                        "Nothing was changed." \
+                        "\nThis is a partial state: complete projections before continuing, as downstream analysis (signals/binning/populations) "
+                        "should only be run after *all* images are projected and segmented."
+                    )
+                else:
+                    print(
+                        f"Status: {n_seg_done_before}/{n_imgs_total} segmented, {n_projected}/{n_imgs_total} projected."
+                        "\nNothing was changed. Use overwrite=True to start a new segmentation round."
+                    )
+            return self.masks, self.flows, self.styles, self.imgs_dn, self.outlines
+
+        if num_imgs is not None:
+            pending = pending[:num_imgs]
+
+        print(
+            f"Starting segmentation run for {len(pending)} image(s). "
+            f"Status before this run: {n_seg_done_before}/{n_imgs_total} segmented, {n_projected}/{n_imgs_total} projected."
+        )
+
+        img_list = [self.projections[idx] for idx in pending]
+        diam_list = [diameter] * len(img_list)
 
         if log:
             io.logger_setup()
-            print("Starting segmentation with Cellpose...")
+            print(f"Step 1: Running Cellpose (diameter={diameter}, channels={channels})...")
 
         masks, flows, styles, imgs_dn = self.cellpose_model.eval(img_list, diameter=diam_list, channels=channels)
         outlines = [utils.masks_to_outlines(m) for m in masks]
 
         if log:
-            print("Segmentation done. Post-processing results...")
             num_masks = len(masks)
-            print(f"Number of masks: {num_masks}")
+            print(f"Step 2: Post-processing results... Number of masks: {num_masks}")
 
-        # Make cell IDs unique (continuing from previous image)
-        prev_max = 0
-        new_masks = []
-        max_val = sum([m.max() for m in masks]) # Maximum index is the sum of all cell ids > 0
+        # Validate existing cells_df against samples_df before appending new cells
+        if self.cells_df is not None and not self.cells_df.empty:
+            existing_cell_ids = set(self.cells_df.index)
+            segmented_rows = self.samples_df[self.samples_df["has_segmentation"]]
+            for _, row in segmented_rows.iterrows():
+                if pd.isna(row["num_cells"]) or int(row["num_cells"]) == 0:
+                    continue
+                if pd.isna(row["cell_id_min"]) or pd.isna(row["cell_id_max"]):
+                    raise ValueError(
+                        "samples_df is inconsistent: segmented row has NA in cell_id_min/cell_id_max. "
+                        "Restart segmentation with overwrite=True to start a new segmentation round."
+                    )
+                cell_id_min = int(row["cell_id_min"])
+                cell_id_max = int(row["cell_id_max"])
+                if cell_id_min not in existing_cell_ids or cell_id_max not in existing_cell_ids:
+                    raise ValueError(
+                        "cells_df is inconsistent with samples_df: at least one stored cell_id_min/cell_id_max "
+                        "is missing in cells_df. Rebuild cells_df before continuing segmentation."
+                    )
+
+        # Make cell IDs unique (continuing from current cells_df if available)
+        prev_max = int(self.cells_df.index.max()) if self.cells_df is not None and not self.cells_df.empty else 0
+        max_val = prev_max + sum([m.max() for m in masks]) # Maximum index is previous max + sum of new ids > 0
         int_type = "int16" if max_val < 32767 else "int32"
-        for i, mask in enumerate(masks):
+        for i, (idx, mask) in enumerate(zip(pending, masks)):
             if log:
-                print(f"Processing mask {i+1}/{num_masks} (int_type={int_type})...")
+                print(f"     Processing mask {i+1}/{num_masks} (int_type={int_type})...")
             new_mask = mask.copy().astype(int_type)
             # Add the number of cells to the DataFrame (as int)
-            self.samples_df.at[i, "num_cells"] = new_mask.max()
+            num_cells = int(new_mask.max())
+            self.samples_df.at[idx, "num_cells"] = num_cells
             # Make the cell IDs unique
             new_mask += prev_max
             new_mask[new_mask == prev_max] = 0
 
             # Save the cell IDs in the DataFrame
-            self.samples_df.at[i, "cell_id_min"] = prev_max + 1
-            self.samples_df.at[i, "cell_id_max"] = new_mask.max()
+            if num_cells > 0:
+                self.samples_df.at[idx, "cell_id_min"] = prev_max + 1
+                self.samples_df.at[idx, "cell_id_max"] = int(new_mask.max())
+            else:
+                self.samples_df.at[idx, "cell_id_min"] = pd.NA
+                self.samples_df.at[idx, "cell_id_max"] = pd.NA
 
             # Set the previous max to the current max
             prev_max = new_mask.max()
 
-            # Append the new mask to the list
-            new_masks.append(new_mask)
+            # Save segmentation outputs in-place
+            self.masks[idx] = new_mask
+            self.flows[idx] = flows[i]
+            self.styles[idx] = styles[i]
+            self.imgs_dn[idx] = imgs_dn[i]
+            self.outlines[idx] = outlines[i]
+            self.samples_df.at[idx, "has_segmentation"] = True
 
-        # Make sure the columns are ints
-        self.samples_df["cell_id_min"] = self.samples_df["cell_id_min"].astype(int)
-        self.samples_df["cell_id_max"] = self.samples_df["cell_id_max"].astype(int)
-        self.samples_df["num_cells"] = self.samples_df["num_cells"].astype(int)
+        # Keep nullable integer dtype to allow non-segmented rows
+        self.samples_df["cell_id_min"] = self.samples_df["cell_id_min"].astype("Int64")
+        self.samples_df["cell_id_max"] = self.samples_df["cell_id_max"].astype("Int64")
+        self.samples_df["num_cells"] = self.samples_df["num_cells"].astype("Int64")
 
-        # Save the masks, flows, styles and denoised images in the object
+        # Save segmentation settings
         self.seg_channels = channels # NOTE: These are 1-indexed
         self.seg_diameter = diameter
-        self.masks = new_masks
-        self.flows = flows
-        self.styles = styles
-        self.imgs_dn = imgs_dn
-        self.outlines = outlines
+
+        n_done = int(self.samples_df["has_segmentation"].sum())
 
         if log:
-            print("Post-processing done.")
-            print("Creating cells DataFrame...")
+            print("Step 3: Creating/updating cells DataFrame...")
 
-        # Start a new df with a row per cell
-        self.create_cells_df(log=log, calculate_neighbours=calculate_neighbours)
+        # Append only the new cells to cells_df
+        self.create_cells_df(log=log, calculate_neighbours=calculate_neighbours, sample_indices=pending, append=not overwrite)
 
-        return new_masks, flows, styles, imgs_dn, outlines
+        print(f"Segmentation run complete. Status after this run: {n_done}/{n_imgs_total} segmented, {n_projected}/{n_imgs_total} projected.")
+
+        if n_projected < n_imgs_total:
+            print()
+            print(
+                f"Important: Not all images currently have projections ({n_projected}/{n_imgs_total}), and segmentation can only process projected images.\n"
+                f"However, downstream analysis is intended to be run on all images together. "
+                "Run downstream analysis only after *all* images are projected and segmented."
+            )
+
+        return self.masks, self.flows, self.styles, self.imgs_dn, self.outlines
     
-    def create_cells_df(self, log=False, calculate_neighbours=True):
+    def create_cells_df(self, log=False, calculate_neighbours=True, sample_indices=None, append=False):
         """
         Creates a DataFrame with a row for each cell in the images.
         The DataFrame contains all columns of the images df, plus specifications for each cell.
         """
         # Create a new DataFrame with a row for each cell
         cells_data = []
-        for i, row in self.samples_df.iterrows():
+        if sample_indices is None:
+            sample_iter = self.samples_df.iterrows()
+        else:
+            sample_iter = self.samples_df.loc[sample_indices].iterrows()
+
+        n = 0
+        tot = len(sample_indices) if sample_indices is not None else len(self.samples_df)
+        for i, row in sample_iter:
+            n += 1
             if log:
-                print(f"Processing image {i+1}/{len(self.samples_df)} for cells DataFrame...")
+                print(f"     Processing image {n}/{tot} for cells DataFrame...")
+            if self.masks is None or i >= len(self.masks) or self.masks[i] is None:
+                continue
             # Get the cell ID range for this image
             cell_id_min = row["cell_id_min"]
             cell_id_max = row["cell_id_max"]
+            if pd.isna(cell_id_min) or pd.isna(cell_id_max):
+                continue
+            cell_id_min = int(cell_id_min)
+            cell_id_max = int(cell_id_max)
+            if cell_id_max < cell_id_min:
+                continue
             # Create a new row for each cell
             mask = self.masks[i]
             for cell_id in range(cell_id_min, cell_id_max + 1):
                 new_row = row.copy()
                 new_row["cell_id"] = cell_id
                 # Calculate the area of the cell
-                cell_mask = mask == cell_id
-                cell_area = np.sum(cell_mask)
-                new_row["cell_area_px"] = cell_area
+                # cell_mask = mask == cell_id
+                # cell_area = np.sum(cell_mask)
+                # new_row["cell_area_px"] = cell_area
                 # Calculate the neighbours of the cell
                 if calculate_neighbours:
                     num_neighbours = self.count_surrounding_cells(mask, cell_id, expected_diameter=self.seg_diameter)
@@ -468,12 +697,22 @@ class CellAnalyzer:
                 cells_data.append(new_row)
 
         # Save the DataFrame in the object
-        self.cells_df = pd.DataFrame(cells_data)
+        if len(cells_data) == 0:
+            if not append or self.cells_df is None:
+                self.cells_df = pd.DataFrame()
+            return
+
+        new_cells_df = pd.DataFrame(cells_data)
         # Drop the columns that are not needed on cell level
-        self.cells_df.drop(columns=["cell_id_min", "cell_id_max", "num_cells"], inplace=True)
+        new_cells_df.drop(columns=["cell_id_min", "cell_id_max", "num_cells", "has_projection", "has_segmentation"], inplace=True, errors="ignore")
         # Reset the index and set it to the cell_id
-        self.cells_df.reset_index(drop=True, inplace=True)
-        self.cells_df.set_index("cell_id", inplace=True)
+        new_cells_df.reset_index(drop=True, inplace=True)
+        new_cells_df.set_index("cell_id", inplace=True)
+
+        if append and self.cells_df is not None and not self.cells_df.empty:
+            self.cells_df = pd.concat([self.cells_df, new_cells_df], axis=0)
+        else:
+            self.cells_df = new_cells_df
 
     def save_segmentation_imgs(self, folder_name="segmentations", background_channels=None, overwrite=False, norm_per_img=False, norm_perc=1, scale_bar_px=150, scale_bar_um=20):
         """
@@ -509,19 +748,31 @@ class CellAnalyzer:
             bg_channels = [n-1 for n in background_channels] # Decrease by 1 to make it 0-indexed
         if len(bg_channels) > 3:
             raise ValueError("Number of background channels must be 3 or less (RGB channels together with outlines).")
+        if self.projections is None or self.projections[0] is None:
+            raise ValueError("Projections are empty. Please run create_projections() first.")
+        if self.outlines is None or self.outlines[0] is None:
+            raise ValueError("Outlines are empty. Please run segment_cells() first.")
+        if self.masks is None or self.masks[0] is None:
+            raise ValueError("Masks are empty. Please run segment_cells() first.")
         overall_mins, overall_maxs = {}, {}
         for bg_channel in bg_channels:
             if bg_channel < 0 or bg_channel >= len(self.projections[0]):
                 raise ValueError(f"Channel {bg_channel+1} is out of bounds for the projections. Available channels: {len(self.projections[0])}.")
             # overall_mins[bg_channel] = min([img[bg_channel].min() for img in self.projections])
             # overall_maxs[bg_channel] = max([img[bg_channel].max() for img in self.projections])
-            all_values = np.concatenate([img[bg_channel].ravel() for img in self.projections])
+            all_values = np.concatenate([img[bg_channel].ravel() for img in self.projections if img is not None])
             overall_mins[bg_channel] = np.percentile(all_values, norm_perc)
             overall_maxs[bg_channel] = np.percentile(all_values, 100-norm_perc)
 
         # Take empty images and add channels such that it's an RGB image
-        for img_num, img in enumerate(self.projections):
-            outline = self.outlines[img_num]
+        n = 0
+        tot = 0
+        for img_num, outline in enumerate(self.outlines):
+            tot += 1
+            img = self.projections[img_num]
+            if img is None or outline is None:
+                continue
+            n += 1
             # Create a new image with 3 channels, to overlay the outlines
             _, h, w = img.shape
             img_rgb = np.zeros((h, w, 3), dtype=np.uint8)
@@ -540,18 +791,23 @@ class CellAnalyzer:
 
             # Save the image
             img_rgb = Image.fromarray(img_rgb)
-            img_dir = out_folder / f"{self.samples_df['filename'][img_num]}_outlines.png"
+            img_dir = out_folder / f"{Path(self.samples_df['filename'][img_num]).stem}_outlines.png"
             # Check if the file already exists
             if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
                 img_rgb.save(img_dir)
 
-        print(img_num+1, "outlines saved.")
-        
-        # MASKS
+        print(f"{n}/{tot} outlines saved.")
 
+        # MASKS
+        n = 0
+        tot = 0
         for img_num, mask in enumerate(self.masks):
+            tot += 1 # count all masks
+            if mask is None:
+                continue
+            n += 1 # count non-empty masks
             new_mask = self.masks[img_num].copy()
             # Subtract the minimum value, but only where it is not 0
             min_val = mask[mask>0].min()
@@ -565,19 +821,19 @@ class CellAnalyzer:
             
             # Save the image
             mapped = Image.fromarray(mapped)
-            img_dir = out_folder / f"{self.samples_df['filename'][img_num]}_masks.png"
+            img_dir = out_folder / f"{Path(self.samples_df['filename'][img_num]).stem}_masks.png"
             # Check if the file already exists
             if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
-                mapped.save(out_folder / f"{self.samples_df['filename'][img_num]}_masks.png")
+                mapped.save(img_dir)
 
-        print(img_num+1, "masks saved.")
+        print(f"{n}/{tot} masks saved.")
 
     def calculate_single_cell_signal(self, channel_name, channel_num, dilate=None, mode="mean"):
         """
         Extracts the mean signal of each cell in the input image(s) based on the masks.
-        Will populate the signal_means_dicts, signal_means_lists and signal_means_masks attributes.
+        Will populate the signals and signal_masks attributes.
 
         Parameters:
             channel_name : str
@@ -598,16 +854,35 @@ class CellAnalyzer:
                 The masks of the signals in each image, with the same shape as the input images.
         """
         # Perform checks
+        if self.samples_df is None:
+            raise ValueError("samples_df is empty. Please run read_data() first.")
+
+        n_samples = len(self.samples_df)
+        if self.projections is None or len(self.projections) != n_samples:
+            raise ValueError("Projections are missing or incomplete. Please run create_projections() for all images first.")
+        if self.masks is None or len(self.masks) != n_samples:
+            raise ValueError("Segmentations are missing or incomplete. Please run segment_cells() for all images first.")
+
+        has_projection = [p is not None for p in self.projections]
+        has_segmentation = [m is not None for m in self.masks]
+        self.samples_df["has_projection"] = has_projection
+        self.samples_df["has_segmentation"] = has_segmentation
+        n_proj = int(sum(has_projection))
+        n_seg = int(sum(has_segmentation))
+        if n_proj < n_samples or n_seg < n_samples:
+            raise ValueError(
+                f"calculate_single_cell_signal() requires full preprocessing on all images first. "
+                f"Current status: projected {n_proj}/{n_samples}, segmented {n_seg}/{n_samples}."
+            )
+
         if self.cells_df is None:
             raise ValueError("cells_df is empty. Please run previous methods in the pipeline first.")
-        if self.masks is None:
-            raise ValueError("masks are empty. Please run segment_cells() first.")
         
         if channel_num < 1 or channel_num >= len(self.projections[0])+1:
-            raise ValueError(f"Channel number {channel_num} for channel {channel_name} is out of bounds for the projections." +
+            raise ValueError(f"Channel number {channel_num} for channel {channel_name} is out of bounds for the projections. " +
                              f"Available channels: {len(self.projections[0])}.")
         if channel_num == 0:
-            raise ValueError(f"You chose 0 as a channel for {channel_name}. This must be an accident." +
+            raise ValueError(f"You chose 0 as a channel for {channel_name}. This must be an accident. " +
                              "Note that the input channels are 1-indexed, and with the input 0, you would be using -1 as index.")
         channel_num -= 1 # Decrease by 1 to make it 0-indexed
 
@@ -620,16 +895,16 @@ class CellAnalyzer:
 
         # Perform the calculation
         cells_df = self.cells_df.copy()
-        signal_dicts_out = []
-        signal_lists_out = []
+        all_signals_out = []
+        # signal_lists_out = []
         signal_masks_out = []
         for img, mask in zip(self.projections, self.masks):
 
             # Extract the channel from the image
             img = img[channel_num]
             # Prepare the empty containers
-            img_signal_dict = {} #{cell_id: np.mean(img[cell_mask_for_mean]) for cell_id in range(1, mask.max()+1)}
-            img_signal_list = [] #[val for k, val in img_signal_means_dict.items()]
+            img_cell_signals_dict = {} #{cell_id: np.mean(img[cell_mask_for_mean]) for cell_id in range(1, mask.max()+1)}
+            # img_signal_list = [] #[val for k, val in img_signal_means_dict.items()]
             img_signal_mask = np.zeros_like(img, dtype=np.float32)
             # add the signal to the dict and mask
             lowest_non_zero = mask[mask != 0].min()
@@ -657,8 +932,8 @@ class CellAnalyzer:
                 # Assign the signal to the cell ID in the dict and mask
                 if np.isnan(cell_signal):
                     cell_signal = 0
-                img_signal_dict[cell_id] = cell_signal
-                img_signal_list.append(cell_signal)
+                img_cell_signals_dict[cell_id] = cell_signal
+                # img_signal_list.append(cell_signal)
                 img_signal_mask += cell_signal * cell_mask # NOTE: use un-altered mask here to have no overlaps between cells, even though for the calculation of the signal, the dilated/eroded mask was used
 
                 # Add the signal to the cells_df
@@ -668,35 +943,35 @@ class CellAnalyzer:
                 # Also add the log10 of the signal
                 cells_df.loc[cell_id, channel_name+"_signal_log10"] = np.log10(cell_signal) if cell_signal > 0 else 0
 
-            signal_dicts_out.append(img_signal_dict)
-            signal_lists_out.append(img_signal_list)
+            all_signals_out.append(img_cell_signals_dict)
+            # signal_lists_out.append(img_signal_list)
             signal_masks_out.append(img_signal_mask)
 
-        self.signal_dicts[channel_name] = signal_dicts_out
-        self.signal_lists[channel_name] = signal_lists_out
+        self.signals[channel_name] = all_signals_out
+        # self.signal_lists[channel_name] = signal_lists_out
         self.signal_masks[channel_name] = signal_masks_out
 
         # Save the cells_df in the object
         self.cells_df = cells_df
-        # Add the signal dilation and mode to the cfg_df
-        if self.cfg_df is not None:
-            self.cfg_df.loc[channel_num, "channel_name"] = channel_name
-            self.cfg_df.loc[channel_num, "signal_dilate"] = dilate
-            self.cfg_df.loc[channel_num, "signal_mode"] = mode
+        # Add the signal dilation and mode to the channels_df
+        if self.channels_df is not None:
+            self.channels_df.loc[channel_num, "channel_name"] = channel_name
+            self.channels_df.loc[channel_num, "signal_dilate"] = dilate
+            self.channels_df.loc[channel_num, "signal_mode"] = mode
             # Move name to first column
-            cols = self.cfg_df.columns.tolist()
+            cols = self.channels_df.columns.tolist()
             cols = ["channel_name"] + [col for col in cols if col != "channel_name"]
-            self.cfg_df = self.cfg_df[cols]
+            self.channels_df = self.channels_df[cols]
         else:
-            self.cfg_df = pd.DataFrame({channel_num: {"channel_name": channel_name, "signal_dilate": dilate, "signal_mode": mode}}).T
+            self.channels_df = pd.DataFrame({channel_num: {"channel_name": channel_name, "signal_dilate": dilate, "signal_mode": mode}}).T
         # Ensure int, since with NaN values, it becomes float
-        self.cfg_df["signal_dilate"] = self.cfg_df["signal_dilate"].astype("Int64")
+        self.channels_df["signal_dilate"] = self.channels_df["signal_dilate"].astype("Int64")
 
         return cells_df, signal_masks_out
 
     def calculate_cell_signals(self, channels, dilate=None, mode="mean"):
         """Extracts the mean signal of each cell in the input image(s) for multiple channels based on the masks.
-        Will populate the signal_dicts, signal_lists and signal_masks attributes.
+        Will populate the signals and signal_masks attributes.
 
         Parameters:
             channels : dict
@@ -741,66 +1016,6 @@ class CellAnalyzer:
             self.calculate_single_cell_signal(channel_name=name, channel_num=channels[name], dilate=dilate[name], mode=mode[name])
 
         return self.cells_df, self.signal_masks
-
-        # cells_df = self.cells_df.copy()
-        # for name, num in channels.items():
-        #     # Reduce the channel number by one (0-indexed)
-        #     num -= 1
-        #     # Prepare the empty containers
-        #     signal_dicts_out = []
-        #     signal_lists_out = []
-        #     signal_masks_out = []
-        #     for img, mask in zip(self.projections, self.masks):
-        #         # Extract the channel from the image
-        #         img = img[num]
-        #         # Prepare the empty containers
-        #         img_signal_dict = {} #{cell_id: np.mean(img[cell_mask_for_mean]) for cell_id in range(1, mask.max()+1)}
-        #         img_signal_list = [] #[val for k, val in img_signal_means_dict.items()]
-        #         img_signal_mask = np.zeros_like(img, dtype=np.float32)
-        #         # add the signal to the dict and mask
-        #         lowest_non_zero = mask[mask != 0].min()
-        #         for cell_id in range(lowest_non_zero, mask.max()+1):
-        #             cell_mask = mask == cell_id
-        #             cell_mask_for_signal = cell_mask.copy()
-        #             # Dilate or erode if needed
-        #             if dilate[name] > 0:
-        #                 cell_mask_for_signal = morphology.binary_dilation(cell_mask_for_signal, morphology.disk(dilate[name]))
-        #             elif dilate[name] < 0:
-        #                 cell_mask_for_signal = morphology.binary_erosion(cell_mask_for_signal, morphology.disk(-dilate[name]))
-        #             # Calculate the mean or median signal for the cell
-        #             if mode[name] == "mean":
-        #                 cell_signal = np.mean(img[cell_mask_for_signal])
-        #             elif mode[name] == "median":
-        #                 cell_signal = np.median(img[cell_mask_for_signal])
-        #             elif "perc_" in mode[name]:
-        #                 perc = int(mode[name].split("_")[-1])
-        #                 cell_signal = np.percentile(img[cell_mask_for_signal], perc)
-        #             else:
-        #                 raise ValueError(f"Mode '{mode[name]}' not recognized. Check docstring for options.")
-        #             # Assign the signal to the cell ID in the dict and mask
-        #             if np.isnan(cell_signal):
-        #                 cell_signal = 0
-        #             img_signal_dict[cell_id] = cell_signal
-        #             img_signal_list.append(cell_signal)
-        #             img_signal_mask += cell_signal * cell_mask # NOTE: use un-altered mask here to have no overlaps between cells
-
-        #             # Add the signal to the cell_df
-        #             cells_df.loc[cell_id, name+"_"+mode[name]] = cell_signal
-        #             # Also add the log10 of the signal
-        #             cells_df.loc[cell_id, name+"_"+mode[name]+"_log10"] = np.log10(cell_signal) if cell_signal > 0 else 0
-
-        #         signal_dicts_out.append(img_signal_dict)
-        #         signal_lists_out.append(img_signal_list)
-        #         signal_masks_out.append(img_signal_mask)
-        
-        #     self.signal_dicts[name] = signal_dicts_out
-        #     self.signal_lists[name] = signal_lists_out
-        #     self.signal_masks[name] = signal_masks_out
-
-        # # Save the cells_df in the object
-        # self.cells_df = cells_df
-
-        # return self.cells_df, self.signal_masks
     
     def save_signal_masks(self, folder_name="signal_masks", overwrite=False, norm_per_img=False, scale_bar_px=150, scale_bar_um=20):
         """
@@ -845,7 +1060,7 @@ class CellAnalyzer:
 
                 # Save the image
                 mapped = Image.fromarray(mapped)
-                img_dir = out_folder / f"{self.samples_df['filename'][img_num]}_{signal_name}_mask.png"
+                img_dir = out_folder / f"{Path(self.samples_df['filename'][img_num]).stem}_{signal_name}_mask.png"
                 # Check if the file already exists
                 if img_dir.exists() and not overwrite:
                     print(f"File {img_dir} already exists. Saving this file was skipped.")
@@ -889,6 +1104,23 @@ class CellAnalyzer:
         if column not in self.cells_df.columns:
             raise ValueError(f"Column '{column}' not found in cells_df. Please run calculate_cell_signals() first.")
 
+        # Quick check: binning requires the signal step to be complete for all images
+        if signal not in self.signal_masks:
+            raise ValueError(
+                f"Signal '{signal}' is missing in signal_masks. "
+                "Please run calculate_cell_signals() first."
+            )
+        if len(self.signal_masks[signal]) != len(self.samples_df) or any([m is None for m in self.signal_masks[signal]]):
+            raise ValueError(
+                f"Signal '{signal}' is incomplete across images. "
+                "Please complete calculate_cell_signals() for all images before binning."
+            )
+        if self.cells_df[column].isna().any():
+            raise ValueError(
+                f"Signal column '{column}' contains NA values. "
+                "Please complete calculate_cell_signals() before binning."
+            )
+
         # Determine threshold if not given
         use_otsu = False
         if thresh is None:
@@ -921,25 +1153,25 @@ class CellAnalyzer:
         self.cells_df[col_name] = bins[0]  # Initialize the column with the first bin
         for t, bin_name in zip(thresh, bins[1:]):
             # Set the bin for the cells that are above the threshold
-            print(f"Thresholding {bin_name} at {t}")
+            print(f"Thresholding '{bin_name}' at {t}")
             self.cells_df.loc[self.cells_df[column] > t, col_name] = bin_name
 
-        # Add a column with the thresholds and parameters used to the cfg_df
-        if self.cfg_df is not None:
-            if "channel_name" in self.cfg_df.columns and signal in self.cfg_df["channel_name"].values:
-                channel_num = self.cfg_df[self.cfg_df["channel_name"] == signal].index[0]
+        # Add a column with the thresholds and parameters used to the channels_df
+        if self.channels_df is not None:
+            if "channel_name" in self.channels_df.columns and signal in self.channels_df["channel_name"].values:
+                channel_num = self.channels_df[self.channels_df["channel_name"] == signal].index[0]
                 thresh_type = f"{'otsu' if use_otsu else 'manual'}"
-                # self.cfg_df.loc[channel_num, f'threshold_{thresh_type}'] = str(thresh)
-                self.cfg_df.loc[channel_num, 'bin_use_log'] = str(use_log)
-                self.cfg_df.loc[channel_num, 'bin_threshold_type'] = thresh_type
-                self.cfg_df.loc[channel_num, f'bin_threshold(s)'] = str(thresh)
+                # self.channels_df.loc[channel_num, f'threshold_{thresh_type}'] = str(thresh)
+                self.channels_df.loc[channel_num, 'bin_use_log'] = str(use_log)
+                self.channels_df.loc[channel_num, 'bin_threshold_type'] = thresh_type
+                self.channels_df.loc[channel_num, f'bin_threshold(s)'] = str(thresh)
             else:
-                print(f"Warning: signal '{signal}' not found in cfg_df. Thresholds not saved in cfg_df.")
+                print(f"Warning: signal '{signal}' not found in channels_df. Thresholds not saved in channels_df.")
         else:
-            print("Warning: cfg_df is None. Thresholds not saved in cfg_df.")
+            print("Warning: channels_df is None. Thresholds not saved in channels_df.")
 
         # Create masks for the bins
-        print(f"Creating bin masks for signal '{signal}'...")
+        # print(f"Creating bin masks for signal '{signal}'...")
         bin_masks_out = []
         for mask in self.masks:
             bins_mask = np.zeros_like(mask, dtype=np.uint16)
@@ -951,7 +1183,7 @@ class CellAnalyzer:
                 bin_num = bin_nums[cell_bin]
                 bins_mask[cell_mask] = bin_num
             bin_masks_out.append(bins_mask)
-            print(f"Created bin mask for image {len(bin_masks_out)}")
+            # print(f"Created bin mask for image {len(bin_masks_out)}")
 
         self.bin_masks[signal] = bin_masks_out
     
@@ -1001,8 +1233,10 @@ class CellAnalyzer:
             raise ValueError('thresh must be a dict with the same keys as signals, or a single value to use for all signals.')
         
         # Bin each signal
+        print(f"Starting binning of signals: {signals}")
         for signal in signals:
             self.bin_single_cell_signal(signal=signal, use_log=use_log[signal], thresh=thresh[signal])
+        print(f"Finished binning of signals: {signals}")
 
         return self.cells_df, self.bin_masks
 
@@ -1046,7 +1280,7 @@ class CellAnalyzer:
 
                 # Save the image
                 mapped = Image.fromarray(mapped)
-                img_dir = out_folder / f"{self.samples_df['filename'][img_num]}_{signal_name}_bin_mask.png"
+                img_dir = out_folder / f"{Path(self.samples_df['filename'][img_num]).stem}_{signal_name}_bin_mask.png"
                 # Check if the file already exists
                 if img_dir.exists() and not overwrite:
                     print(f"File {img_dir} already exists. Saving this file was skipped.")
@@ -1077,11 +1311,28 @@ class CellAnalyzer:
         """
         # Check if the signals are in the cells_df
         for i, signal in enumerate(signals):
+            source_signal = signal[:-4] if signal[-4:] == "_bin" else signal
             if signal[-4:] != "_bin":
                 signal = signal+"_bin"
                 signals[i] = signal
             if signal not in self.cells_df.columns:
                 raise ValueError(f"Bin column for signal '{signal}' not found in cells_df. Please run calculate_cell_signals() and bin_cell_signal() first.")
+            # Quick check: populations require binning to be complete for all images
+            if source_signal not in self.bin_masks or source_signal not in self.bins:
+                raise ValueError(
+                    f"Binning results for signal '{source_signal}' not found. "
+                    "Please run bin_cell_signals() first."
+                )
+            if len(self.bin_masks[source_signal]) != len(self.samples_df) or any([m is None for m in self.bin_masks[source_signal]]):
+                raise ValueError(
+                    f"Binning for signal '{source_signal}' is incomplete across images. "
+                    "Please complete bin_cell_signals() before creating populations."
+                )
+            if self.cells_df[signal].isna().any():
+                raise ValueError(
+                    f"Bin column '{signal}' contains NA values. "
+                    "Please complete bin_cell_signals() before creating populations."
+                )
 
         # Create a new column for the population, and temp columns
         pop_col_name = col_name if col_name is not None else "_".join([s[:3] for s in signals]) + "_pop"
@@ -1130,7 +1381,7 @@ class CellAnalyzer:
 
             # Save the image
             img_rgb = Image.fromarray(img_rgb)
-            img_dir = out_folder / f"{self.samples_df['filename'][i]}_{pop_name}.png"
+            img_dir = out_folder / f"{Path(self.samples_df['filename'][i]).stem}_{pop_name}.png"
             if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
@@ -1167,7 +1418,7 @@ class CellAnalyzer:
         print("Folder:", out_folder)
 
     @staticmethod
-    def count_surrounding_cells(mask, cell_id, expected_diameter):
+    def count_surrounding_cells(mask, cell_id): #, expected_diameter):
         """
         Count how many other cells are within a circular region around a given cell,
         adjusted for edge effects (partial circle outside image).
@@ -1184,37 +1435,46 @@ class CellAnalyzer:
             float
                 Scaled number of unique other cell IDs within the defined circle.
         """
-        props = regionprops((mask == cell_id).astype(np.uint8))
-        if not props:
-            raise ValueError(f"Cell ID {cell_id} not found in mask.")
-        region = props[0]
+        # props = regionprops((mask == cell_id).astype(np.uint8))
+        # if not props:
+        #     raise ValueError(f"Cell ID {cell_id} not found in mask.")
+        # region = props[0]
 
-        # Cell centroid (y, x)
-        cy, cx = region.centroid
-        # Equivalent circular radius
-        area = np.sum(mask == cell_id)
-        radius = np.sqrt(area / np.pi)
-        extended_radius = radius + expected_diameter/2
-        # print("Cell ID:", cell_id, "Centroid:", (cy, cx), "Radius:", radius, "Extended radius:", extended_radius)
+        # # Cell centroid (y, x)
+        # cy, cx = region.centroid
+        # # Equivalent circular radius
+        # area = np.sum(mask == cell_id)
+        # radius = np.sqrt(area / np.pi)
+        # extended_radius = radius + expected_diameter/2
+        # # print("Cell ID:", cell_id, "Centroid:", (cy, cx), "Radius:", radius, "Extended radius:", extended_radius)
 
-        y_indices, x_indices = np.indices(mask.shape)
-        dist = np.sqrt((x_indices - cx)**2 + (y_indices - cy)**2)
-        circle_mask = dist <= extended_radius
+        # y_indices, x_indices = np.indices(mask.shape)
+        # dist = np.sqrt((x_indices - cx)**2 + (y_indices - cy)**2)
+        # circle_mask = dist <= extended_radius
 
-        # Fraction of circle inside the image (edge correction)
-        # Theoretical total circle area:
-        circle_area = np.pi * extended_radius**2
-        # Pixels actually inside image:
-        inside_area = np.sum(circle_mask)
-        inside_fraction = inside_area / circle_area
+        # # Fraction of circle inside the image (edge correction)
+        # # Theoretical total circle area:
+        # circle_area = np.pi * extended_radius**2
+        # # Pixels actually inside image:
+        # inside_area = np.sum(circle_mask)
+        # inside_fraction = inside_area / circle_area
 
-        # Get IDs within the circle
-        surrounding_ids = np.unique(mask[circle_mask])
-        surrounding_ids = surrounding_ids[(surrounding_ids != 0) & (surrounding_ids != cell_id)]
+        # # Get IDs within the circle
+        # surrounding_ids = np.unique(mask[circle_mask])
+        # surrounding_ids = surrounding_ids[(surrounding_ids != 0) & (surrounding_ids != cell_id)]
+
+        cell = mask == cell_id
+        # dilation = expected_diameter // 2
+        dilated = morphology.dilation(cell, morphology.disk(1))
+
+        neighbors = np.unique(mask[dilated])
+        neighbors = neighbors[(neighbors != 0) & (neighbors != cell_id)]
+        return len(neighbors)
 
         # Edge-corrected estimate
-        corrected_count = len(surrounding_ids) / inside_fraction if inside_fraction > 0 else np.nan
-        return corrected_count
+        # inside_fraction = np.count_nonzero(cell) / np.count_nonzero(dilated) if np.count_nonzero(dilated) > 0 else 0
+        # corrected_count = len(neighbors) / inside_fraction if inside_fraction > 0 else np.nan
+        # return corrected_count
 
     @staticmethod
     def _add_scale_bar(img_rgb, scale_bar_px=150, scale_bar_um=20):
@@ -1299,206 +1559,110 @@ class CellAnalyzer:
         # Merge overlay and return an RGB uint8 image, consistent with the save pipeline.
         out = Image.alpha_composite(base, overlay).convert("RGB")
         return np.array(out, dtype=np.uint8)
-
-
-#####################################################################################
-
-
-    def get_sep_rel_pop_counts_df(pop_counts_df, bin1_name=None, bin2_name=None):
+    
+    def save_tiff_stacks(self, stack_dims=["projections", "seg_masks", "outlines", "signals", "bins"], folder_name="tiffs", overwrite=False):
         """
-        Takes a DataFrame with the population counts and returns the counts of the two bins
-        separately and as relative values.
-        If bin2_name is given, the columns will be renamed accordingly.
+        Saves the images, masks, signal masks and bin masks as TIFF stacks.
 
         Parameters:
-            pop_counts_df : pd.DataFrame
-                A DataFrame with one row, and the populations as columns.
-            bin2_name : str, optional
-                The name of the second variable.
-
-        Returns:
-            df_1 : pd.DataFrame
-                A DataFrame with the counts of the first bin.
-            df_2 : pd.DataFrame
-                A DataFrame with the counts of the second bin.
-            df_1_rel : pd.DataFrame
-                A DataFrame with the relative counts of the first bin.
-            df_2_rel : pd.DataFrame
-                A DataFrame with the relative counts of the second bin.
+            stack_dims : tuple of str
+                The dimensions to include in the TIFF stacks. Possible values are "projections", "seg_masks", "outlines", "signals" and "bins". Default is all.
+            folder_name : str
+                The name of the (sub-)folder to save the TIFF stacks to.
+            overwrite : bool
+                Whether to overwrite existing files. Default is False.
         """
-        # Split the DataFrame into two parts
-        df_1 = pop_counts_df.copy().iloc[:,:2]
-        df_2 = pop_counts_df.copy().iloc[:,2:]
-
-        # Calculate the relative values
-        df_1_rel = df_1.div(df_1.sum(axis=1), axis=0)
-        df_2_rel = df_2.div(df_2.sum(axis=1), axis=0)
-
-        # Rename the columns if bin2_name is given
-        # NOTE: This naming is not flexible for bin numbers other than 2
-        for df in [df_1, df_2, df_1_rel, df_2_rel]:
-            if bin2_name is not None:
-                df.columns = ["non-" + bin2_name, bin2_name]
-
-        # Save in dictionaries
-        # NOTE: This naming is not flexible for bin numbers other than 2
-        if bin1_name is not None:
-            keys = ["non-" + bin1_name, bin1_name]
-        else:
-            keys = ["1", "2"]
-        abs = {keys[0]: df_1, keys[1]: df_2}
-        rel = {keys[0]: df_1_rel, keys[1]: df_2_rel}
-
-        return abs, rel
+        stack_keys = {"projections": self.projections,
+                      "seg_masks": self.masks,
+                      "outlines": self.outlines,
+                      "signals": self.signal_masks,
+                      "bins": self.bin_masks}
+        for dim in stack_dims:
+            if dim not in stack_keys:
+                raise ValueError(f"Invalid dimension '{dim}' in stack_dims. Valid options are: {list(stack_keys.keys())}.")
+            if stack_keys[dim] is None:
+                print(f"Warning: {dim} is selected for TIFF stacks but is None. This dimension will be skipped.")
+                stack_dims = [d for d in stack_dims if d != dim]
         
+        # Create the folder if it doesn't exist
+        out_folder = self.path / folder_name
+        out_folder.mkdir(parents=True, exist_ok=True)
 
-    ### HELPER FUNCTIONS ###
+        for i in range(len(self.samples_df)):
+            if any([stack_keys[dim][i] is None for dim in ("projections", "seg_masks", "outlines")]):
+                break  # Stop when projection/segmentation has not been performed for this image, to avoid saving incomplete stacks
+            stacks = []
+            for dim in stack_dims:                    
+                if dim == "projections":
+                    stacks.append(self.projections[i])
+                    # print(f"Projection shape for image {i}: {self.projections[i].shape}")
+                if dim == "seg_masks":
+                    mask = self.masks[i].reshape(1, *self.masks[i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
+                    stacks.append(mask.astype(np.uint16))
+                    # print(f"Segmentation mask shape for image {i}: {mask.shape}")
+                if dim == "outlines":
+                    outline = self.outlines[i].reshape(1, *self.outlines[i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
+                    stacks.append(outline.astype(np.uint16))
+                    # print(f"Outline shape for image {i}: {outline.shape}")
+                if dim == "signals" and self.signal_masks:
+                    for signal_name in self.signal_masks.keys():
+                        signal = self.signal_masks[signal_name][i].reshape(1, *self.signal_masks[signal_name][i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
+                        stacks.append(signal.astype(np.uint16))
+                    # print(f"Signal mask shapes for image {i}: {[s.shape for s in stacks[-len(self.signal_masks):]]}")
+                if dim == "bins" and self.bin_masks:
+                    for signal_name in self.bin_masks.keys():
+                        bin_mask = self.bin_masks[signal_name][i].reshape(1, *self.bin_masks[signal_name][i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
+                        stacks.append(bin_mask.astype(np.uint16))
+                    # print(f"Bin mask shapes for image {i}: {[s.shape for s in stacks[-len(self.bin_masks):]]}")
 
-    def normalize(input):
+            if not stacks:
+                print(f"Found no valid data for the chosen input. Please make sure stack_dims is a choice of the following:")
+                print(f"{list(stack_keys.keys())}")
+                return
 
-        if not isinstance(input, list):
-            images = [input]
-        else:
-            images = input
+            # Stack along a new axis (the first axis)
+            tiff_stack = np.concatenate(stacks, axis=0)
+            # print(f"TIFF stack shape for image {i}: {tiff_stack.shape}")
 
-        # Step 1: Normalize each image to the range [0, 1]
-        normalized_images = []
-
-        for image in images:
-            # Normalize the image to [0, 1]
-            norm_image = (image - np.min(image)) / (np.max(image) - np.min(image))
-            # Rescale to [0, 255]
-            norm_image = norm_image * 255
-            normalized_images.append(norm_image.astype(np.uint8))
-
-        # Step 2: Compute global mean and std (or use a reference image)
-        global_mean = np.mean([np.mean(image) for image in normalized_images])
-        global_std = np.std([np.std(image) for image in normalized_images])
-
-        # Step 3: Normalize the mean and std of each image to match the global mean and std
-        final_normalized_images = []
-
-        for image in normalized_images:
-            # Normalize the image to have the global mean and std
-            image_mean = np.mean(image)
-            image_std = np.std(image)
-            standardized_image = (image - image_mean) / image_std
-            standardized_image = standardized_image * global_std + global_mean
-            # Clip the values to be between 0 and 255
-            standardized_image = np.clip(standardized_image, 0, 255)
-            final_normalized_images.append(standardized_image.astype(np.uint8))
+            # Save the TIFF stack
+            img_dir = out_folder / f"{Path(self.samples_df['filename'][i]).stem}_stack.tiff"
+            if img_dir.exists() and not overwrite:
+                print(f"File {img_dir} already exists. Saving this file was skipped.")
+            else:
+                imwrite(img_dir, tiff_stack)
         
-        if not isinstance(input, list):
-            final_normalized_images = final_normalized_images[0]
-        
-        return final_normalized_images
+        print(i+1, "TIFF stacks saved.")
 
-
-    ### WRAPPER & PLOTTING FUNCTIONS ###
-
-    def seg_mean_bin_pop(seg_input, signal1_input, signal2_input, masks=None, norm=True,
-                        diameter=100, dilate=0, signal1_thresh= 'otsu_overall', signal2_thresh= 'otsu_overall',
-                        signal1_name="signal 1", signal2_name="signal 2", sample_names=None,
-                        plt_res=False):
-        
-        # Segment the images
-        if masks is None:
-            masks, flows, styles, imgs_dn = segment(seg_input, diameter=diameter)
-
-        # Pre-process
-        signal1_input = check_make_single_ch(signal1_input)
-        signal2_input = check_make_single_ch(signal2_input)
-        if norm:
-            signal1_input = normalize(signal1_input)
-            signal2_input = normalize(signal2_input)
-
-        # Get the means and bins
-        signal1_means, signal1_means_list, signal1_means_mask = get_means(signal1_input, masks, dilate=dilate)
-        signal2_means, signal2_means_list, signal2_means_mask = get_means(signal2_input, masks, dilate=dilate)
-        means = {signal1_name: signal1_means, signal2_name: signal2_means}
-
-        # Get the bins
-        # IMPORTANT: THIS DEFAULT THRESHOLD MIGHT NEED TO BE ADJUSTED
-        if signal1_thresh == 'otsu_overall':
-            # signal1_thresh = np.mean(signal1_means_list)
-            signal1_thresh = threshold_otsu(np.concatenate(signal1_means_list))
-            print("signal1_thresh", signal1_thresh)
-        elif signal1_thresh == 'otsu-per-sample':
-            signal1_thresh = None
-        elif type(signal1_thresh) != int or type(signal1_thresh) != float:
-            raise ValueError('signal1_thresh must be an integer or float.')
-        if signal2_thresh ==  'otsu_overall':
-            # signal2_thresh = np.mean(signal2_means_list)
-            signal2_thresh = threshold_otsu(np.concatenate(signal2_means_list))
-            print("signal2_thresh", signal2_thresh)
-        elif signal2_thresh == 'otsu-per-sample':
-            signal2_thresh = None
-        elif type(signal2_thresh) != int or type(signal2_thresh) != float:
-            raise ValueError('signal2_thresh must be an integer or float.')
-        signal1_bins, signal1_bins_list, signal1_bins_mask = get_bins(signal1_means, signal1_thresh, masks)
-        signal2_bins, signal2_bins_list, signal2_bins_mask = get_bins(signal2_means, signal2_thresh, masks)
-        bins = {signal1_name: signal1_bins, signal2_name: signal2_bins}
-
-        # Get the populations
-        cell_pop_dicts, pop_counts, pop_counts_dfs, pop_counts_matrix_dfs = get_pop(signal1_bins, signal2_bins,
-                                                                                    signal1_name, signal2_name)
-        pop_masks = get_pop_mask(cell_pop_dicts, masks)
-
-        # Combine samples
-        overall_count_df = pd.concat(pop_counts_dfs)
-        if sample_names is not None:
-            overall_count_df.index = sample_names
-
-        # Get the separate, relative populations
-        abs, rel = get_sep_rel_pop_counts_df(overall_count_df, signal1_name, signal2_name)
-
-        # Get the overall population matrix
-        overall_count_matrix_df = sum(pop_counts_matrix_dfs)
-        overall_perc_matrix_df = overall_count_matrix_df / overall_count_matrix_df.sum().sum()
-
-        if plt_res:
-            plot_bin2_in_bin1(rel)
-
-        return masks, means, bins, cell_pop_dicts, pop_counts, overall_count_df, rel
-
-    def plot_bin2_in_bin1(rel_in):
+    def add_region_props(self, properties=["area", "perimeter", "eccentricity", "orientation", "centroid"]):
         """
-        Plots the relative populations of bin2 in bin1.
-        Creates a Barplot with a bar for each bin1 value (negative and positive),
-        and each bar represents the relative amount of bin2 values in the bin1.
-        Only works with two bins for now.
-        
+        Adds region properties to the cells_df DataFrame based on the segmentation masks.
+
         Parameters:
-            rel_in : Dictionary
-                The relative populations. The keys are the bin1 values, and the values are DataFrames.
-                Each DataFrame has the bin2 values as columns and the relative populations as rows.
-
-        Returns:
-            None
+            properties : tuple of str
+                The region properties to calculate. Default is ("area", "perimeter", "eccentricity", "orientation", "centroid", "bbox").
+                For more information on available properties, see skimage.measure.regionprops_table.
         """
-        inf_in_cil = pd.concat([df.iloc[:, 1] for df in rel_in.values()],
-                            axis=1)
-        inf_in_cil.columns = rel_in.keys()
+        # Checks for the properties argument (needs to be a list)
+        if not isinstance(properties, (list, tuple)):
+            raise ValueError("properties must be a list or tuple of strings corresponding to skimage.measure.regionprops_table properties.")
+        elif isinstance(properties, tuple):
+            properties = list(properties)
 
-        plt.figure(figsize=(2, 3), dpi=200)
-        sns.barplot(data=inf_in_cil, errorbar='sd', color='skyblue', capsize=0.1)
-        plt.title(list(rel_in.values())[0].columns[1])
-        # plt.ylim(0, 1)
-        plt.gca().spines['top'].set_visible(False)
-        plt.gca().spines['right'].set_visible(False)
-        plt.show()
+        temp_df = pd.DataFrame()  # Temporary DataFrame to hold properties for all images
+        for i, mask in enumerate(self.masks):
+            if mask is None:
+                break
+            props = regionprops_table(
+                mask,
+                intensity_image=np.moveaxis(self.projections[i],0,-1),
+                properties=["label"] + properties
+            )
+            props_df = pd.DataFrame(props)
+            # 
+            temp_df = pd.concat([temp_df, props_df], ignore_index=True, axis=0)
 
-    def plot_bins(rel_in):
-        
-        fig, ax = plt.subplots(1, len(rel_in), figsize=(3*len(rel_in), 5))
-        plot_num = 0
-        for key, val in rel_in.items():
-            sns.barplot(data=val, errorbar='sd', color='skyblue', capsize=0.1, ax=ax[plot_num])
-            ax[plot_num].set_title(key)
-            ax[plot_num].set_ylim(0, 1)
-            ax[plot_num].spines['top'].set_visible(False)
-            ax[plot_num].spines['right'].set_visible(False)
-            plot_num += 1
-
-        plt.tight_layout()
-        plt.show()
+        # Join properties by cell ID while preserving the existing cells_df index.
+        # Using merge(..., right_on="label") resets the index and can shift row alignment.
+        props_by_cell_id = temp_df.set_index("label")
+        self.cells_df.drop(columns=props_by_cell_id.columns, inplace=True, errors='ignore')
+        self.cells_df = self.cells_df.join(props_by_cell_id, how="left")
