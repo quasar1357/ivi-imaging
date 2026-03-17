@@ -1560,7 +1560,7 @@ class CellAnalyzer:
         out = Image.alpha_composite(base, overlay).convert("RGB")
         return np.array(out, dtype=np.uint8)
     
-    def save_tiff_stacks(self, stack_dims=["projections", "seg_masks", "outlines", "signals", "bins"], folder_name="tiffs", overwrite=False):
+    def export_data_as_tiff_stacks(self, stack_dims=["projections", "seg_masks", "outlines", "signals", "bins"], folder_name="tiffs", overwrite=False):
         """
         Saves the images, masks, signal masks and bin masks as TIFF stacks.
 
@@ -1583,6 +1583,8 @@ class CellAnalyzer:
             if stack_keys[dim] is None:
                 print(f"Warning: {dim} is selected for TIFF stacks but is None. This dimension will be skipped.")
                 stack_dims = [d for d in stack_dims if d != dim]
+
+        suffix = "_".join(d[:3] for d in stack_dims)
         
         # Create the folder if it doesn't exist
         out_folder = self.path / folder_name
@@ -1625,7 +1627,7 @@ class CellAnalyzer:
             # print(f"TIFF stack shape for image {i}: {tiff_stack.shape}")
 
             # Save the TIFF stack
-            img_dir = out_folder / f"{Path(self.samples_df['filename'][i]).stem}_stack.tiff"
+            img_dir = out_folder / f"{Path(self.samples_df['filename'][i]).stem}__{suffix}__stack.tiff"
             if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
