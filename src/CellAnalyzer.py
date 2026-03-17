@@ -1627,7 +1627,7 @@ class CellAnalyzer:
             # print(f"TIFF stack shape for image {i}: {tiff_stack.shape}")
 
             # Save the TIFF stack
-            img_dir = out_folder / f"{Path(self.samples_df['filename'][i]).stem}__{suffix}__stack.tiff"
+            img_dir = out_folder / f"{Path(self.samples_df['filename'][i]).stem}_{suffix}_stack.tiff"
             if img_dir.exists() and not overwrite:
                 print(f"File {img_dir} already exists. Saving this file was skipped.")
             else:
