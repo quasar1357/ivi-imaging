@@ -134,6 +134,11 @@ class CellAnalyzer:
             loaded_instance.img_arrays = [AICSImage(loaded_instance.samples_df["filepath"][i]) for i in range(len(loaded_instance.samples_df))]
             # Convert to numpy array
             loaded_instance.img_arrays = [img.get_image_data("CZYX", T=0) for img in loaded_instance.img_arrays]
+            # Mark all samples as loaded when images are loaded from pickle
+            try:
+                loaded_instance.samples_df["is_loaded"] = True
+            except Exception:
+                loaded_instance.samples_df["is_loaded"] = [True] * len(loaded_instance.samples_df)
 
         # Cellpose model
         loaded_instance.load_cellpose_model()
@@ -152,11 +157,12 @@ class CellAnalyzer:
                                             restore_type="denoise_cyto3")
 
     def read_data(self, parsing_settings="ALI",
-                  regex_pattern=None, date_format=None, file_extension=None):
+                  regex_pattern=None, date_format=None, file_extension=None,
+                  reset=False):
         """
         Parses structured microscopy .dv filenames from a given folder and returns a DataFrame
         with extracted metadata.
-        Takes the path from the class initialization. Saves the DataFrame and image arrays in the object.
+        Takes the path from the class initialization. Saves the DataFrame in the object.
 
         Parameters:
             parsing_settings : str, optional
@@ -174,6 +180,8 @@ class CellAnalyzer:
             file_extension : str, optional
                 The file extension to look for in the filenames. Only needed if parsing_settings is "custom".
                 Examples: ".dv", ".nd2", ".tif".
+            reset : bool, optional
+                If True, resets all existing data in the object (images, projections, segmentations, cells_df) and starts fresh with only the new samples_df. Default is False.
 
         Returns:
             pd.DataFrame, np.array:
@@ -182,6 +190,21 @@ class CellAnalyzer:
         """
         input_path = self.path
 
+        # Do resets if requested (and check consistency with existing data)
+        if reset:
+            self.img_arrays = None
+            self.projections = None
+            self.projections_types = None
+            self.masks = None
+            self.flows = None
+            self.styles = None
+            self.imgs_dn = None
+            self.outlines = None
+            self.cells_df = None
+        elif self.samples_df is not None:
+            raise ValueError("samples_df already exists. Use reset=True to clear existing data and start fresh with the new samples_df. This will also reset all downstream data (images, projections, segmentations, cells_df).")
+
+        # Checks
         checks = [regex_pattern is not None, date_format is not None, file_extension is not None]
         if any(checks) and parsing_settings != "custom":
             raise ValueError("regex_pattern, date_format and file_extension should only be provided if parsing_settings is 'custom'.")
@@ -266,17 +289,81 @@ class CellAnalyzer:
         if not df.empty:
             df['date'] = pd.to_datetime(df['date'], format=date_format)
 
-        # Load the image
-        imgs = [AICSImage(df["filepath"][i]) for i in range(len(df))]
-        # Convert to numpy array
-        img_arrays = [img.get_image_data("CZYX", T=0) for img in imgs] # 3D image stack, all channels
-        print(len(img_arrays), "images loaded")
-
         # Save in the object
         self.samples_df = df
-        self.img_arrays = img_arrays
 
-        return df, img_arrays
+        # Track whether images have been loaded into memory
+        # This is used for sequential processing of image loading/projection/segmentation
+        self.samples_df["is_loaded"] = False
+
+        return df
+
+    def load_images(self, num_imgs=None, overwrite=False):
+        """
+        Loads the images from the file paths in samples_df and saves them in the object.
+        Skips images that have already been loaded unless overwrite=True.
+        Tracks progress in samples_df["is_loaded"].
+
+        Parameters:
+            num_imgs : int
+                The maximum number of images to load. Default is None (all remaining images).
+            overwrite : bool
+                If True, re-project all images, discarding existing projections. Required when changing types. Default is False.
+        """
+        # Basic checks
+        if self.samples_df is None:
+            raise ValueError("samples_df is empty. Please run read_data() first.")
+
+        n_total = len(self.samples_df)
+
+        # Initialize img_arrays tracking if needed
+        if self.img_arrays is None:
+            self.img_arrays = [None] * n_total
+        elif len(self.img_arrays) != n_total and not overwrite:
+            raise ValueError(
+                "Length mismatch between img_arrays and samples_df. "
+                "Use overwrite=True in load_images() to start a clean image-loading round."
+            )
+
+        # Handle overwrite: reset loaded images
+        if overwrite:
+            prev_loaded = int(self.samples_df["is_loaded"].sum()) if "is_loaded" in self.samples_df.columns else 0
+            if prev_loaded > 0:
+                print(f"Using overwrite=True: resetting loaded images ({prev_loaded}/{n_total} images were loaded). Starting a new load round.")
+            self.img_arrays = [None] * n_total
+            self.samples_df["is_loaded"] = False
+
+        # Keep tracking aligned with current img_arrays
+        self.samples_df["is_loaded"] = [ia is not None for ia in self.img_arrays]
+
+        # Determine which images still need to be loaded
+        pending = self.samples_df.index[~self.samples_df["is_loaded"]].tolist()
+        n_loaded_before = int(self.samples_df["is_loaded"].sum())
+
+        if not pending:
+            if overwrite:
+                # If overwrite was requested but nothing pending now, be explicit
+                print(f"Using overwrite=True: no images to load after reset. Status: {n_loaded_before}/{n_total} loaded.")
+            else:
+                print(f"Image loading status: {n_loaded_before}/{n_total} images already loaded. Nothing to do. Use overwrite=True to reload images.")
+            return self.img_arrays
+
+        if num_imgs is not None:
+            pending = pending[:num_imgs]
+
+        print(f"Loading {len(pending)} image(s). Status before this run: {n_loaded_before}/{n_total} loaded.")
+
+        # Load only pending images
+        for idx in pending:
+            img = AICSImage(self.samples_df.at[idx, "filepath"])
+            arr = img.get_image_data("CZYX", T=0)
+            self.img_arrays[idx] = arr
+            self.samples_df.at[idx, "is_loaded"] = True
+
+        n_loaded_after = int(self.samples_df["is_loaded"].sum())
+        print(f"{len(pending)} image(s) loaded. Status after this run: {n_loaded_after}/{n_total}.")
+
+        return self.img_arrays
 
     def create_projections(self, types=["max","max","max","max"], c_axis=0, z_axis=1, num_imgs=None, overwrite=False):
         """
@@ -296,14 +383,37 @@ class CellAnalyzer:
                 The maximum number of new projections to create. Default is None (all remaining images).
             overwrite : bool
                 If True, re-project all images, discarding existing projections. Required when changing types. Default is False.
+                If False, changing types is not allowed.
 
         Returns:
             projections : list of np.arrays
                 The projections of the images (may contain None for images not yet projected).
         """
-        # Check if images are loaded
+        # Basic checks
+        if self.samples_df is None:
+            raise ValueError("samples_df is empty. Please run read_data() first.")
         if self.img_arrays is None:
-            raise ValueError("Image arrays are empty. Please run read_data() first, or load existing instance with `.load(..., load_images=True)`.")
+            raise ValueError("img_arrays is empty. Please run load_images() first.")
+
+        n_imgs_total = len(self.samples_df)
+
+        # Derive `is_loaded` from `img_arrays` (single source of truth)
+        if len(self.img_arrays) != n_imgs_total:
+            raise ValueError(
+                "Length mismatch between img_arrays and samples_df. "
+                "Use overwrite=True in load_images() to start a clean image-loading round."
+            )
+        self.samples_df["is_loaded"] = [ia is not None for ia in self.img_arrays]
+        if self.projections is None:
+            self.samples_df["has_projection"] = False # Set to False for all rows if projections not initialized yet
+        elif len(self.projections) != n_imgs_total:
+            raise ValueError(
+                "Length mismatch between projections and samples_df. "
+                "Use overwrite=True in create_projections() to start a clean projection round."
+            )
+        else:
+            self.samples_df["has_projection"] = [p is not None for p in self.projections]
+
         # Check if the axis indices are valid
         if c_axis < 0 or c_axis > 3 or z_axis < 0 or z_axis > 3 or c_axis == z_axis:
             raise ValueError("Axis indices must be between 0 and 3 and different from each other.")
@@ -312,38 +422,52 @@ class CellAnalyzer:
         if len(types) != num_channels:
             raise ValueError(f"Number of types ({len(types)}) does not match number of channels ({num_channels}).")
 
-        # Handle existing projections / type conflicts
-        prev_proj = 0 if self.projections is None else sum([p is not None for p in self.projections])
-        if overwrite and prev_proj > 0:
-            print(f"Creating projections with overwrite=True: resetting projections ({prev_proj}/{len(self.img_arrays)} images had projections). Starting a new projection round.")
+        # Handle parameter consistency or reset projections (if overwrite=True)
+        if overwrite:
+            prev_proj = int(self.samples_df["has_projection"].sum()) if "has_projection" in self.samples_df.columns else 0
+            if prev_proj > 0:
+                print(f"Using overwrite=True: resetting projections ({prev_proj}/{n_imgs_total} images had projections). Starting a new projection round.")
             if self.projections_types is not None and self.projections_types != types:
-                print(f"Projection types changed from {self.projections_types} to {types}.")
+                print(f"You changed projection types from {self.projections_types} to {types}.")
                 print("\nWarning: if you have already performed downstream analysis, these might now be inconsistent with the new projections. Consider re-running those steps as well.")
-            self.projections = [None] * len(self.img_arrays)
+            self.projections = [None] * n_imgs_total
+            self.projections_types = None
             self.samples_df["has_projection"] = False
-        elif self.projections_types is not None and self.projections_types != types:
-            raise ValueError(
-                f"Projection types {types} differ from existing {self.projections_types}. "
-                "Use overwrite=True to replace all projections with the new types."
-            )
+        else:
+            if self.projections_types is not None and self.projections_types != types:
+                raise ValueError(
+                    f"Projection types {types} differ from existing {self.projections_types}. "
+                    "Use overwrite=True to replace all projections with the new types."
+                )
 
-        # Initialize projection list and derive tracking from it (single source of truth)
+        # Initialize projection container if needed
         if self.projections is None:
-            self.projections = [None] * len(self.img_arrays)
-        elif len(self.projections) != len(self.img_arrays):
-            raise ValueError(
-                "Length mismatch between projections and image arrays. "
-                "Use overwrite=True in create_projections() to start a clean projection round."
-            )
+            self.projections = [None] * n_imgs_total
+
+        # Keep tracking aligned with current projections
         self.samples_df["has_projection"] = [p is not None for p in self.projections]
 
-        # Determine which images still need projections
-        pending = self.samples_df.index[~self.samples_df["has_projection"]].tolist()
-        n_done_before = int(self.samples_df["has_projection"].sum())
-        n_pending_before = len(pending)
+        # Project only images that are loaded and not projected yet
+        pending = self.samples_df.index[
+            (self.samples_df["is_loaded"]) & (~self.samples_df["has_projection"])
+        ].tolist()
+        pending = [idx for idx in pending if self.img_arrays[idx] is not None]
+        n_projected_before = int(self.samples_df["has_projection"].sum())
+        n_loaded = int(self.samples_df["is_loaded"].sum())
+        n_not_loaded = n_imgs_total - n_loaded
 
         if not pending:
-            print(f"Projection status: {n_done_before}/{len(self.img_arrays)} images already have projections. Nothing was changed. Use overwrite=True to start a new projection round.")
+            if overwrite:
+                # If overwrite was requested but nothing pending now, be explicit
+                print(f"Using overwrite=True: no projections to create after reset. Status: {n_projected_before}/{n_imgs_total} projected.")
+            else:
+                if n_loaded > 0 and n_projected_before == n_loaded and n_loaded < n_imgs_total:
+                    print(
+                        f"All loaded images are already projected ({n_projected_before}/{n_imgs_total}), but {n_not_loaded} image(s) are not loaded yet. "
+                        "Nothing was changed.\nComplete loading before continuing, as downstream analysis requires projections for all images."
+                    )
+                else:
+                    print(f"Projection status: {n_projected_before}/{n_imgs_total} images already have projections. Nothing was changed. Use overwrite=True to start a new projection round.")
             return self.projections
 
         if num_imgs is not None:
@@ -351,10 +475,10 @@ class CellAnalyzer:
 
         print(
             f"Creating projections for {len(pending)} image(s). "
-            f"Status before this run: {n_done_before}/{len(self.img_arrays)}."
+            f"Status before this run: {n_projected_before}/{n_imgs_total}."
         )
 
-        # z_axis shifts by -1 after channel extraction if it came after c_axis
+        #z_axis shifts by -1 after channel extraction if it came after c_axis
         _z_axis = z_axis - 1 if z_axis > c_axis else z_axis
 
         # Create projections for pending images
@@ -386,7 +510,7 @@ class CellAnalyzer:
             self.samples_df.at[idx, "has_projection"] = True
 
         n_done = int(self.samples_df["has_projection"].sum())
-        print(f"{len(pending)} projection(s) created. Status after this run: {n_done}/{len(self.img_arrays)}.")
+        print(f"{len(pending)} projection(s) created. Status after this run: {n_done}/{n_imgs_total}.")
 
         # Save the projection types
         self.projections_types = types
@@ -397,8 +521,148 @@ class CellAnalyzer:
         else:
             self.channels_df["projection"] = types
 
+        # Inform user if some images are not loaded into memory yet
+        if n_loaded < n_imgs_total:
+            print()
+            print(
+                f"Important: Not all images are currently loaded ({n_loaded}/{n_imgs_total}). "
+                "Please note that projections can only be created for loaded images. Run load_images() to load the remaining images."
+            )
+
         return self.projections
+    
+    def directly_load_and_project(self, types=["max", "max", "max", "max"], c_axis=0, z_axis=1,
+                                  num_imgs=None, overwrite=False):
+        """
+        Loads the images from the file paths in samples_df, directly creates projections and only saves those in the object.
+        Skips images that already have a projection unless overwrite=True.
+        Tracks progress in samples_df["has_projection"].
+
+        Parameters:
+            types : list of str
+                The projection types for each channel.
+            c_axis : int
+                The axis of the channels in the image arrays. Default is 0 (CZYX).
+            z_axis : int
+                The axis of the z-dimension in the image arrays. Default is 1 (CZYX).
+            num_imgs : int
+                The maximum number of images to load. Default is None (all remaining images).
+            overwrite : bool
+                If True, re-project all images, discarding existing projections. Required when changing types. Default is False.
+        """
+        # Basic checks
+        if self.samples_df is None:
+            raise ValueError("samples_df is empty. Please run read_data() first.")
+
+        n_total = len(self.samples_df)
+
+        # Check if the axis indices are valid
+        if c_axis < 0 or c_axis > 3 or z_axis < 0 or z_axis > 3 or c_axis == z_axis:
+            raise ValueError("Axis indices must be between 0 and 3 and different from each other.")
+        # Test number channels - only if at least one image is already loaded, otherwise we cannot know the number of channels yet
+        if self.img_arrays is not None and len(self.img_arrays) > 0 and self.img_arrays[0] is not None:
+            num_channels = self.img_arrays[0].shape[c_axis]
+            if len(types) != num_channels:
+                raise ValueError(f"Number of types ({len(types)}) does not match number of channels ({num_channels}).")
+
+        # Handle parameter consistency or reset projections (if overwrite=True)
+        if overwrite:
+            prev_proj = int(self.samples_df["has_projection"].sum()) if "has_projection" in self.samples_df.columns else 0
+            if prev_proj > 0:
+                print(f"Using overwrite=True: resetting projections ({prev_proj}/{n_total} images had projections). Starting a new projection round.")
+            if self.projections_types is not None and self.projections_types != types:
+                print(f"You changed projection types from {self.projections_types} to {types}.")
+                print("\nWarning: if you have already performed downstream analysis, these might now be inconsistent with the new projections. Consider re-running those steps as well.")
+            self.projections = [None] * n_total
+            self.projections_types = None
+            self.samples_df["has_projection"] = False
+        else:
+            if self.projections_types is not None and self.projections_types != types:
+                raise ValueError(
+                    f"Projection types {types} differ from existing {self.projections_types}. "
+                    "Use overwrite=True to replace all projections with the new types."
+                )
+
+        # Initialize projection container if needed
+        if self.projections is None:
+            self.projections = [None] * n_total
+
+        # Keep tracking aligned with current projections
+        self.samples_df["has_projection"] = [p is not None for p in self.projections]
+
+        # Determine which images still need to be projected (only those that are not projected yet, regardless of whether they are loaded or not)
+        pending = self.samples_df.index[~self.samples_df["has_projection"]].tolist()
+        n_projected_before = int(self.samples_df["has_projection"].sum())
+
+        if not pending:
+            if overwrite:
+                # If overwrite was requested but nothing pending now, be explicit
+                print(f"Using overwrite=True: no images to load after reset. Status: {n_projected_before}/{n_total} projected.")
+            else:
+                print(f"Image projection status: {n_projected_before}/{n_total} images already projected. Nothing to do. Use overwrite=True to re-project images.")
+            return self.projections
+
+        if num_imgs is not None:
+            pending = pending[:num_imgs]
+
+        print(
+            f"Loading and creating projections for {len(pending)} image(s). "
+            f"Status before this run: {n_projected_before}/{n_total}."
+        )
+
+        # Projection preparations: z_axis shifts by -1 after channel extraction if it came after c_axis
+        _z_axis = z_axis - 1 if z_axis > c_axis else z_axis
         
+        # Load only pending images, project directly and save projections (without saving the full images in img_arrays to save memory)
+        for idx in pending:
+            img_in = AICSImage(self.samples_df.at[idx, "filepath"])
+            img = img_in.get_image_data("CZYX", T=0)
+            img_projections = []
+            for i in range(img.shape[c_axis]):
+                # Get the projection type for the current channel
+                proj_type = types[i]
+                img_channel = np.take(img, indices=i, axis=c_axis)
+                if proj_type == "max":
+                    proj = np.max(img_channel, axis=_z_axis)
+                elif proj_type == "min":
+                    proj = np.min(img_channel, axis=_z_axis)
+                elif proj_type == "mean":
+                    proj = np.mean(img_channel, axis=_z_axis)
+                elif proj_type == "median":
+                    proj = np.median(img_channel, axis=_z_axis)
+                elif proj_type == "sum":
+                    proj = np.sum(img_channel, axis=_z_axis)
+                elif "perc_" in proj_type:
+                    perc = int(proj_type.split("_")[-1])
+                    proj = np.percentile(img_channel, perc, axis=_z_axis)
+                else:
+                    raise ValueError(f"Projection type '{proj_type}' not recognized. Use 'sum', 'max', 'min', or 'mean'.")
+                img_projections.append(proj)
+
+            self.projections[idx] = np.stack(img_projections, axis=c_axis)
+            self.samples_df.at[idx, "has_projection"] = True
+
+            # Clean up to avoid keeping large arrays in memory
+            try:
+                del img
+                del img_in
+            except Exception:
+                pass
+
+        n_projected_after = int(self.samples_df["has_projection"].sum())
+        print(f"{len(pending)} image(s) projected. Status after this run: {n_projected_after}/{n_total}.")
+
+        # Save projection types
+        self.projections_types = types
+
+        # Save the projection types in channels_df
+        if self.channels_df is None:
+            self.channels_df = pd.DataFrame({"projection": types})
+        else:
+            self.channels_df["projection"] = types
+
+        return self.projections
+
     def segment_cells(self, diameter=100, channels=[0,0], log=False, calculate_neighbours=True, num_imgs=None, overwrite=False):
         """
         Segments the input image(s) into separate cells using the Cellpose model.
