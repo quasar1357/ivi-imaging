@@ -1240,7 +1240,7 @@ class CellAnalyzer:
         return cells_df, signal_masks_out
 
     def calculate_cell_signals(self, channels, dilate=None, mode="mean", subtract_min=False):
-        """Extracts the mean signal of each cell in the input image(s) for multiple channels based on the masks.
+        """Extracts the mean/median/percentile signal of each cell in the input image(s) for multiple channels based on the masks.
         Will populate the signals and signal_masks attributes.
 
         Parameters:
@@ -1253,7 +1253,8 @@ class CellAnalyzer:
                 If a dict is given, it should have the same keys as channels, with the corresponding dilation values.
                 Note: dilation/erosion here means that the cell boundaries are expanded or contracted by approximately this many pixels.
             mode: str or dict
-                The mode used to calculate the representative signal for each cell. If a single str is given, it is applied to all channels. If a dict is given, it should have the same keys as channels, with the corresponding mode values.
+                The mode used to calculate the representative signal for each cell.
+                If a single str is given, it is applied to all channels. If a dict is given, it should have the same keys as channels, with the corresponding mode values.
                 Default = "mean"; "perc_X" means X-th percentile
             subtract_min: bool
                 Whether to subtract the minimum value of the signal in the image from the cell signals. Default is False.
@@ -1262,7 +1263,8 @@ class CellAnalyzer:
             cells_df : pd.DataFrame
                 The cells DataFrame with the calculated representative signal of each cell in the image(s) for each channel.
             signal_masks : dict
-                A dictionary with channel names as keys and lists of np.arrays as values, where each list contains the masks of the signals in each image for the corresponding channel, with the same shape as the input images.
+                A dictionary with channel names as keys and lists of np.arrays as values,
+                where each list contains the masks of the signals in each image for the corresponding channel, with the same shape as the input images.
         """
         # Perform checks
         if isinstance(dilate, int) or dilate is None:
@@ -1491,7 +1493,9 @@ class CellAnalyzer:
             cells_df : pd.DataFrame
                 The cells DataFrame with the added columns for the binned signals.
             bin_masks : dict
-                A dictionary with signal names as keys and lists of np.arrays as values, where each list contains the masks of the binned signals in each image for the corresponding signal, with the same shape as the input images, where the value of each cell is the bin number.
+                A dictionary with signal names as keys and lists of np.arrays as values,
+                where each list contains the masks of the binned signals in each image for the corresponding signal,
+                with the same shape as the input images,where the value of each cell is the bin number.
         """
         # Perform checks
         if isinstance(signals, str):
