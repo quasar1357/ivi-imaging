@@ -805,7 +805,7 @@ class CellAnalyzer:
                     )
                 else:
                     print(
-                        f"Status: {n_seg_done_before}/{n_imgs_total} segmented, {n_projected}/{n_imgs_total} projected."
+                        f"Status: {n_projected}/{n_imgs_total} projected, {n_seg_done_before}/{n_imgs_total} segmented."
                         "\nNothing was changed. Use overwrite=True to start a new segmentation round. Or run create_cells_df() if there was an error during creation of cells_df."
                     )
             return self.masks, self.flows, self.styles, self.imgs_dn, self.outlines
@@ -815,7 +815,7 @@ class CellAnalyzer:
 
         print(
             f"Starting segmentation run for {len(pending)} image(s). "
-            f"Status before this run: {n_seg_done_before}/{n_imgs_total} segmented, {n_projected}/{n_imgs_total} projected."
+            f"Status before this run: {n_projected}/{n_imgs_total} projected, {n_seg_done_before}/{n_imgs_total} segmented."
         )
 
         img_list = [self.projections[idx] for idx in pending]
@@ -903,7 +903,7 @@ class CellAnalyzer:
         # Append only the new cells to cells_df
         self.create_cells_df(log=log, calculate_neighbours=calculate_neighbours, sample_indices=pending, append=not overwrite)
 
-        print(f"Segmentation run complete. Status after this run: {n_done}/{n_imgs_total} segmented, {n_projected}/{n_imgs_total} projected.")
+        print(f"Segmentation run complete. Status after this run: {n_projected}/{n_imgs_total} projected, {n_done}/{n_imgs_total} segmented.")
 
         if n_projected < n_imgs_total:
             print()
@@ -1094,7 +1094,7 @@ class CellAnalyzer:
 
         print(f"{n}/{tot} masks saved.")
 
-    def calculate_single_cell_signal(self, channel_name, channel_num, dilate=None, mode="mean"):
+    def calculate_single_cell_signal(self, channel_name, channel_num, dilate=None, mode="mean", subtract_min=False):
         """
         Extracts the mean signal of each cell in the input image(s) based on the masks.
         Will populate the signals and signal_masks attributes.
@@ -1107,9 +1107,12 @@ class CellAnalyzer:
             dilate : int
                 The amount of dilation to apply to the masks before calculating the mean signal.
                 If negative, erosion is applied instead of dilation.
+                Note: dilation/erosion here means that the cell boundaries are expanded or contracted by approximately this many pixels.
             mode: str
                 The mode used to calculate the representative signal for each cell
                 Default = "mean"; "perc_X" means X-th percentile
+            subtract_min: bool
+                Whether to subtract the minimum value of the signal in the image from the cell signals. Default is False.
 
         Returns:
             cells_df : pd.DataFrame
@@ -1182,7 +1185,7 @@ class CellAnalyzer:
                 elif dilate < 0:
                     cell_mask_for_signal = morphology.binary_erosion(cell_mask_for_signal, morphology.disk(-dilate))
 
-                # Calculate the mean or median signal for the cell
+                # Calculate the mean, median or percentile signal for the cell
                 if mode == "mean":
                     cell_signal = np.mean(img[cell_mask_for_signal])
                 elif mode == "median":
@@ -1192,6 +1195,9 @@ class CellAnalyzer:
                     cell_signal = np.percentile(img[cell_mask_for_signal], perc)
                 else:
                     raise ValueError(f"Mode '{mode}' not recognized for channel {channel_name}. Check docstring for options.")
+                # Optionally subtract the minimum value of the signal in the image (e.g. to correct for background)
+                if subtract_min:
+                    cell_signal -= img[cell_mask_for_signal].min()
 
                 # Assign the signal to the cell ID in the dict and mask
                 if np.isnan(cell_signal):
@@ -1233,7 +1239,7 @@ class CellAnalyzer:
 
         return cells_df, signal_masks_out
 
-    def calculate_cell_signals(self, channels, dilate=None, mode="mean"):
+    def calculate_cell_signals(self, channels, dilate=None, mode="mean", subtract_min=False):
         """Extracts the mean signal of each cell in the input image(s) for multiple channels based on the masks.
         Will populate the signals and signal_masks attributes.
 
@@ -1245,9 +1251,12 @@ class CellAnalyzer:
                 If negative, erosion is applied instead of dilation.
                 If a single int is given, it is applied to all channels.
                 If a dict is given, it should have the same keys as channels, with the corresponding dilation values.
+                Note: dilation/erosion here means that the cell boundaries are expanded or contracted by approximately this many pixels.
             mode: str or dict
                 The mode used to calculate the representative signal for each cell. If a single str is given, it is applied to all channels. If a dict is given, it should have the same keys as channels, with the corresponding mode values.
                 Default = "mean"; "perc_X" means X-th percentile
+            subtract_min: bool
+                Whether to subtract the minimum value of the signal in the image from the cell signals. Default is False.
 
         Returns:
             cells_df : pd.DataFrame
@@ -1277,7 +1286,7 @@ class CellAnalyzer:
 
         # Calculate the signals for each channel
         for name in channels.keys():
-            self.calculate_single_cell_signal(channel_name=name, channel_num=channels[name], dilate=dilate[name], mode=mode[name])
+            self.calculate_single_cell_signal(channel_name=name, channel_num=channels[name], dilate=dilate[name], mode=mode[name], subtract_min=subtract_min)
 
         return self.cells_df, self.signal_masks
     
