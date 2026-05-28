@@ -273,7 +273,8 @@ class CellAnalyzer:
         df['sample'] = df['sample'].fillna('00')
 
         # Sort the DataFrame by condition, donor, time, date, and sample
-        df.sort_values(by=['condition', 'donor', 'time', 'date', 'sample'], inplace=True)
+        sort_cols = [col for col in ['condition', 'donor', 'time', 'date', 'sample'] if col in df.columns]
+        df.sort_values(by=sort_cols, inplace=True)
 
         # Create a new column for "replicate", which is a unique number within each condition-donor group
         df['replicate'] = df.groupby(['condition', 'donor']).cumcount() + 1
@@ -549,7 +550,7 @@ class CellAnalyzer:
 
         return self.projections
 
-    def subtract_background_on_projections(self, channels=None, sigma=None, multiplier=2, avg_imgs=False, clip=True, overwrite=False, require_full_projections=True):
+    def subtract_background_on_projections(self, channels=None, sigma=None, multiplier=2, avg_imgs=False, clip=True, overwrite=False, allow_partial_projections=False):
         """
         Subtract a wide Gaussian-blurred background from the existing projections.
 
@@ -575,9 +576,9 @@ class CellAnalyzer:
             overwrite : bool
                 If True, allows overwriting existing background-subtracted projections.
                 If False, channels that are already marked as bg_subtracted in `self.channels_df` will be skipped to avoid accidental overwriting.
-            require_full_projections : bool
-                If True, raises an error if not all images have projections. This is the recommended setting for production runs to ensure consistency.
-                If False, allows proceeding with background subtraction on existing projections even if some images are missing projections (useful for quick testing), but issues a warning about potential inconsistencies.
+            allow_partial_projections : bool
+                If True, allows background subtraction on existing projections even if some images are missing projections (useful for quick testing), but issues a warning about potential inconsistencies.
+                If False, raises an error if not all images have projections. This is the recommended setting for production runs to ensure consistency.
 
         Returns:
             None
@@ -590,9 +591,9 @@ class CellAnalyzer:
         n_total = len(self.samples_df) if self.samples_df is not None else len(self.projections)
         n_proj = int(sum([1 for p in self.projections if p is not None]))
         if n_proj < n_total:
-            if require_full_projections: # This is the save default behaviour that should be used for production runs to avoid silent inconsistencies
+            if not allow_partial_projections: # This is the save default behaviour that should be used for production runs to avoid silent inconsistencies
                 raise ValueError(f"Not all images have projections ({n_proj}/{n_total}). Please create projections for all images before background subtraction.\n" + 
-                  "OR, if you want to test on a subset of images, you can set require_full_projections=False to proceed anyways (with only a warning).")
+                  "OR, if you want to test on a subset of images, you can set allow_partial_projections=True to proceed anyways (with only a warning).")
             else: # Behaviour can be relaxed for quick testing on a subset of images
                 print(f"Warning: Not all images have projections ({n_proj}/{n_total}). Proceeding; you can project remaining images with create_projections().")
                 print(f"Be aware that background subtraction will only be applied to existing projections, and downstream analysis typically requires projections for all images.")
@@ -792,7 +793,7 @@ class CellAnalyzer:
 
         # Report how many images were modified for visibility in partial-run cases
         print(
-            f"Channel {ch}: Background subtraction applied to {modified_count} projections (avg_imgs={avg_imgs}, sigma={sigma}, overwrite={overwrite})."
+            f"Channel {ch}: Background subtraction applied to {modified_count} projections (sigma={sigma}, avg_imgs={avg_imgs})."
         )
     
     def directly_load_and_project(self, types=["max", "max", "max", "max"], c_axis=0, z_axis=1,
@@ -1135,8 +1136,8 @@ class CellAnalyzer:
 
         # Make cell IDs unique (continuing from current cells_df if available)
         prev_max = int(self.cells_df.index.max()) if self.cells_df is not None and not self.cells_df.empty else 0
-        max_val = prev_max + sum([m.max() for m in masks]) # Maximum index is previous max + sum of new ids > 0
-        int_type = "int16" if max_val < 32767 else "int32"
+        # Use int32 by default to avoid overflow when processing many files/cells.
+        int_type = "int32"
         for i, (idx, mask) in enumerate(zip(pending, masks)):
             if log:
                 print(f"     Processing mask {i+1}/{num_masks} (int_type={int_type})...")
@@ -1353,10 +1354,12 @@ class CellAnalyzer:
             if mask is None:
                 continue
             n += 1 # count non-empty masks
-            new_mask = self.masks[img_num].copy()
+            # Work on a signed copy to avoid unsigned underflow when subtracting
+            mask_signed = mask.astype(np.int32)
+            new_mask = mask_signed.copy()
             # Subtract the minimum value, but only where it is not 0
-            min_val = mask[mask>0].min()
-            new_mask[mask > 0] -= (min_val -1)
+            min_val = mask_signed[mask_signed > 0].min()
+            new_mask[mask_signed > 0] -= (min_val - 1)
             # Normalize to 0-1
             new_mask = (new_mask - new_mask.min()) / (new_mask.max() - new_mask.min())
             # Map to cmap
@@ -2158,20 +2161,24 @@ class CellAnalyzer:
                     # print(f"Projection shape for image {i}: {self.projections[i].shape}")
                 if dim == "seg_masks":
                     mask = self.masks[i].reshape(1, *self.masks[i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
-                    stacks.append(mask.astype(np.uint16))
+                    # Use uint32 for segmentation masks to avoid overflow when labels exceed 65535
+                    stacks.append(mask.astype(np.uint32))
                     # print(f"Segmentation mask shape for image {i}: {mask.shape}")
                 if dim == "outlines":
                     outline = self.outlines[i].reshape(1, *self.outlines[i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
-                    stacks.append(outline.astype(np.uint16))
+                    # Outlines are binary/small-valued; uint8 is sufficient and compact
+                    stacks.append(outline.astype(np.uint8))
                     # print(f"Outline shape for image {i}: {outline.shape}")
                 if dim == "signals" and self.signal_masks:
                     for signal_name in self.signal_masks.keys():
                         signal = self.signal_masks[signal_name][i].reshape(1, *self.signal_masks[signal_name][i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
-                        stacks.append(signal.astype(np.uint16))
+                        # Signals can be floating values; preserve precision with float32
+                        stacks.append(signal.astype(np.float32))
                     # print(f"Signal mask shapes for image {i}: {[s.shape for s in stacks[-len(self.signal_masks):]]}")
                 if dim == "bins" and self.bin_masks:
                     for signal_name in self.bin_masks.keys():
                         bin_mask = self.bin_masks[signal_name][i].reshape(1, *self.bin_masks[signal_name][i].shape)  # add an extra axis to make it 3D (1, H, W) for stacking
+                        # Bin numbers are small; uint16 is sufficient and compact
                         stacks.append(bin_mask.astype(np.uint16))
                     # print(f"Bin mask shapes for image {i}: {[s.shape for s in stacks[-len(self.bin_masks):]]}")
 
