@@ -460,6 +460,19 @@ class CellAnalyzer:
         if self.projections_orig is None:
             self.projections_orig = [None] * n_imgs_total
 
+        # Initialize per-channel projection stats columns (lists per-sample)
+        if 'proj_mins' not in self.samples_df.columns:
+            self.samples_df['proj_mins'] = pd.NA
+        if 'proj_maxs' not in self.samples_df.columns:
+            self.samples_df['proj_maxs'] = pd.NA
+        if 'proj_means' not in self.samples_df.columns:
+            self.samples_df['proj_means'] = pd.NA
+        # Reset stats on overwrite
+        if overwrite:
+            self.samples_df['proj_mins'] = pd.NA
+            self.samples_df['proj_maxs'] = pd.NA
+            self.samples_df['proj_means'] = pd.NA
+
         # Keep tracking aligned with current projections
         self.samples_df["has_projection"] = [p is not None for p in self.projections]
 
@@ -527,6 +540,19 @@ class CellAnalyzer:
 
             if self.projections_orig is not None and self.projections_orig[idx] is None:
                 self.projections_orig[idx] = np.copy(self.projections[idx])
+            # Compute per-channel min/max/mean and save as lists in samples_df
+            try:
+                p = self.projections[idx]
+                if p is not None:
+                    ch_mins = [float(x) for x in np.min(p, axis=(1, 2))]
+                    ch_maxs = [float(x) for x in np.max(p, axis=(1, 2))]
+                    ch_means = [float(x) for x in np.mean(p, axis=(1, 2))]
+                    self.samples_df.at[idx, 'proj_mins'] = ch_mins
+                    self.samples_df.at[idx, 'proj_maxs'] = ch_maxs
+                    self.samples_df.at[idx, 'proj_means'] = ch_means
+            except Exception:
+                # Non-fatal: continue if stats cannot be computed for some reason
+                pass
 
         n_done = int(self.samples_df["has_projection"].sum())
         print(f"{len(pending)} projection(s) created. Status after this run: {n_done}/{n_imgs_total}.")
@@ -702,6 +728,7 @@ class CellAnalyzer:
         # If requested, compute a single averaged background image across all projections for this channel
         background_plane = None
         modified_count = 0
+        modified_indices = []
         if avg_imgs:
             planes = [p[ch].astype(np.float32) for p in source_projections if p is not None]
             if len(planes) == 0:
@@ -741,6 +768,7 @@ class CellAnalyzer:
                 target_proj[ch] = corrected.astype(dtype, copy=False)
                 self.projections[i] = target_proj
                 modified_count += 1
+                modified_indices.append(i)
         else: # Do NOT average across images, but subtract per-image blurred background
             # Apply subtraction per-image (existing behaviour)
             for i, src_proj in enumerate(source_projections):
@@ -777,6 +805,7 @@ class CellAnalyzer:
                 # Save target back
                 self.projections[i] = target_proj
                 modified_count += 1
+                modified_indices.append(i)
 
         # Update channels_df only for this channel
         if 'bg_subtracted' not in self.channels_df.columns:
@@ -785,6 +814,26 @@ class CellAnalyzer:
             self.channels_df['bg_sigma'] = pd.NA
         if 'bg_avg' not in self.channels_df.columns:
             self.channels_df['bg_avg'] = False
+
+        # Update per-channel projection stats for all modified images (reflect current self.projections)
+        if modified_indices:
+            try:
+                if 'proj_mins' not in self.samples_df.columns:
+                    self.samples_df['proj_mins'] = pd.NA
+                    self.samples_df['proj_maxs'] = pd.NA
+                    self.samples_df['proj_means'] = pd.NA
+                for mi in modified_indices:
+                    pcur = self.projections[mi]
+                    if pcur is None:
+                        continue
+                    ch_mins = [float(x) for x in np.min(pcur, axis=(1, 2))]
+                    ch_maxs = [float(x) for x in np.max(pcur, axis=(1, 2))]
+                    ch_means = [float(x) for x in np.mean(pcur, axis=(1, 2))]
+                    self.samples_df.at[mi, 'proj_mins'] = ch_mins
+                    self.samples_df.at[mi, 'proj_maxs'] = ch_maxs
+                    self.samples_df.at[mi, 'proj_means'] = ch_means
+            except Exception:
+                pass
 
         self.channels_df.at[ch, 'bg_subtracted'] = True
         # record sigma only if a Gaussian was used
@@ -865,6 +914,19 @@ class CellAnalyzer:
         if not hasattr(self, 'projections_orig') or self.projections_orig is None:
             self.projections_orig = [None] * n_total
 
+        # Initialize per-channel projection stats columns (lists per-sample)
+        if 'proj_mins' not in self.samples_df.columns:
+            self.samples_df['proj_mins'] = pd.NA
+        if 'proj_maxs' not in self.samples_df.columns:
+            self.samples_df['proj_maxs'] = pd.NA
+        if 'proj_means' not in self.samples_df.columns:
+            self.samples_df['proj_means'] = pd.NA
+        # Reset stats on overwrite
+        if overwrite:
+            self.samples_df['proj_mins'] = pd.NA
+            self.samples_df['proj_maxs'] = pd.NA
+            self.samples_df['proj_means'] = pd.NA
+
         # Keep tracking aligned with current projections
         self.samples_df["has_projection"] = [p is not None for p in self.projections]
 
@@ -923,6 +985,19 @@ class CellAnalyzer:
             # Save original projection for this index if not already present
             if self.projections_orig is not None and self.projections_orig[idx] is None:
                 self.projections_orig[idx] = np.copy(self.projections[idx])
+
+            # Compute per-channel min/max/mean and save as lists in samples_df
+            try:
+                p = self.projections[idx]
+                if p is not None:
+                    ch_mins = [float(x) for x in np.min(p, axis=(1, 2))]
+                    ch_maxs = [float(x) for x in np.max(p, axis=(1, 2))]
+                    ch_means = [float(x) for x in np.mean(p, axis=(1, 2))]
+                    self.samples_df.at[idx, 'proj_mins'] = ch_mins
+                    self.samples_df.at[idx, 'proj_maxs'] = ch_maxs
+                    self.samples_df.at[idx, 'proj_means'] = ch_means
+            except Exception:
+                pass
 
             # Clean up to avoid keeping large arrays in memory
             try:
