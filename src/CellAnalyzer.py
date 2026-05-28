@@ -5,6 +5,7 @@ from cellpose import core, denoise, io, utils
 from skimage import morphology
 from skimage.measure import regionprops, regionprops_table
 from skimage.filters import threshold_otsu
+from scipy.ndimage import gaussian_filter
 import pandas as pd
 import seaborn as sns
 from pathlib import Path
@@ -24,6 +25,7 @@ class CellAnalyzer:
         self.img_arrays = None
         self.projections = None
         self.projections_types = None
+        self.projections_orig = None
         self.seg_channels = None
         self.seg_diameter = None
         self.masks = None
@@ -78,6 +80,7 @@ class CellAnalyzer:
             'samples_df': self.samples_df,
             'projections': self.projections,
             'projections_types': self.projections_types,
+            'projections_orig': self.projections_orig,
             'seg_channels': self.seg_channels,
             'seg_diameter': self.seg_diameter,
             'masks': self.masks,
@@ -195,6 +198,7 @@ class CellAnalyzer:
             self.img_arrays = None
             self.projections = None
             self.projections_types = None
+            self.projections_orig = None
             self.masks = None
             self.flows = None
             self.styles = None
@@ -433,6 +437,15 @@ class CellAnalyzer:
             self.projections = [None] * n_imgs_total
             self.projections_types = None
             self.samples_df["has_projection"] = False
+            self.projections_orig = [None] * n_imgs_total
+            # Clear any saved originals/provenance because projections are being replaced
+            if self.channels_df is not None:
+                if 'bg_subtracted' in self.channels_df.columns:
+                    self.channels_df['bg_subtracted'] = False
+                if 'bg_sigma' in self.channels_df.columns:
+                    self.channels_df['bg_sigma'] = pd.NA
+                if 'bg_avg' in self.channels_df.columns:
+                    self.channels_df['bg_avg'] = False
         else:
             if self.projections_types is not None and self.projections_types != types:
                 raise ValueError(
@@ -443,6 +456,8 @@ class CellAnalyzer:
         # Initialize projection container if needed
         if self.projections is None:
             self.projections = [None] * n_imgs_total
+        if self.projections_orig is None:
+            self.projections_orig = [None] * n_imgs_total
 
         # Keep tracking aligned with current projections
         self.samples_df["has_projection"] = [p is not None for p in self.projections]
@@ -509,6 +524,9 @@ class CellAnalyzer:
             self.projections[idx] = np.stack(img_projections, axis=c_axis)
             self.samples_df.at[idx, "has_projection"] = True
 
+            if self.projections_orig is not None and self.projections_orig[idx] is None:
+                self.projections_orig[idx] = np.copy(self.projections[idx])
+
         n_done = int(self.samples_df["has_projection"].sum())
         print(f"{len(pending)} projection(s) created. Status after this run: {n_done}/{n_imgs_total}.")
 
@@ -530,6 +548,252 @@ class CellAnalyzer:
             )
 
         return self.projections
+
+    def subtract_background_on_projections(self, channels=None, sigma=None, multiplier=2, avg_imgs=False, clip=True, overwrite=False, require_full_projections=True):
+        """
+        Subtract a wide Gaussian-blurred background from the existing projections.
+
+        Behaviour & provenance:
+        - This method operates on `self.projections` (assumed shape (C, H, W) per image).
+        - Originals are saved in `self.projections_orig` the first time this method is called.
+          Callers can revert to originals by inspecting `self.projections_orig`.
+        - Parameters are stored in `self.channels_df` as columns `bg_subtracted` and `bg_sigma`
+
+        Parameters:
+            channels : list of int or None
+                Channel indices (0-based) to apply subtraction to. If None, all channels are used.
+            sigma : float or None
+                Gaussian sigma (in pixels) for the background blur. If None and
+                `self.seg_diameter` is available, sigma will be set to
+                `max(1, int(round(self.seg_diameter * multiplier)))`.
+            multiplier : float
+                Multiplier used when deriving sigma from `seg_diameter` (default 2).
+            avg_imgs : bool
+                If True, computes a single average background image across all projections for each channel and subtracts that from each image.
+            clip : bool
+                If True, negative values after subtraction are clipped to 0.
+            overwrite : bool
+                If True, allows overwriting existing background-subtracted projections.
+                If False, channels that are already marked as bg_subtracted in `self.channels_df` will be skipped to avoid accidental overwriting.
+            require_full_projections : bool
+                If True, raises an error if not all images have projections. This is the recommended setting for production runs to ensure consistency.
+                If False, allows proceeding with background subtraction on existing projections even if some images are missing projections (useful for quick testing), but issues a warning about potential inconsistencies.
+
+        Returns:
+            None
+        """
+        # Basic checks
+        if self.projections is None:
+            raise ValueError("Projections are empty. Create projections first.")
+
+        # Warn user if not all images have projections, but allow continuing (useful for quick tests)
+        n_total = len(self.samples_df) if self.samples_df is not None else len(self.projections)
+        n_proj = int(sum([1 for p in self.projections if p is not None]))
+        if n_proj < n_total:
+            if require_full_projections: # This is the save default behaviour that should be used for production runs to avoid silent inconsistencies
+                raise ValueError(f"Not all images have projections ({n_proj}/{n_total}). Please create projections for all images before background subtraction.\n" + 
+                  "OR, if you want to test on a subset of images, you can set require_full_projections=False to proceed anyways (with only a warning).")
+            else: # Behaviour can be relaxed for quick testing on a subset of images
+                print(f"Warning: Not all images have projections ({n_proj}/{n_total}). Proceeding; you can project remaining images with create_projections().")
+                print(f"Be aware that background subtraction will only be applied to existing projections, and downstream analysis typically requires projections for all images.")
+                print(f"Make sure to not mix background-subtracted with non-subtracted projections (or with subtraction using different parameters) in downstream analysis.")
+
+        # Determine sigma. If `multiplier` is explicitly None we treat that as "no blur" intent
+        if sigma is None:
+            if multiplier is None:
+                if not avg_imgs: # Early exit if no blur intended and not averaging
+                    print("Neither sigma/multiplier given, and avg_imgs=False: No background subtraction to perform.")
+                    return
+                # explicit request to skip Gaussian blur (sigma stays None)
+                print("No sigma and multiplier=None: proceeding without Gaussian blur (raw averages/subtraction).")
+            else:
+                if self.seg_diameter is not None:
+                    sigma = max(1, int(round(self.seg_diameter * multiplier)))
+                    print(f"No sigma given: deriving sigma from seg_diameter={self.seg_diameter} -> sigma={sigma} (multiplier={multiplier})")
+                else:
+                    raise ValueError("sigma not provided and seg_diameter unknown. Provide sigma or run segmentation first to provide a cell diameter.")
+
+        # Determine channels
+        sample_proj = next((p for p in self.projections if p is not None), None)
+        if sample_proj is None:
+            raise ValueError("No non-empty projection found to infer channels.")
+        num_channels = sample_proj.shape[0]
+        if channels is None:
+            channels = list(range(num_channels))
+        else:
+            # Validate channels parameter
+            if any([c < 0 or c >= num_channels for c in channels]):
+                raise ValueError(f"Channel indices out of range. Projections have {num_channels} channels (0-based indices).")
+
+        # Call per-channel worker to avoid touching other channels' entries
+        for ch in channels:
+            self._subtract_background_channel(ch=ch, sigma=sigma, multiplier=multiplier, avg_imgs=avg_imgs, overwrite=overwrite, clip=clip)
+
+        print(f"Background subtraction completed for requested channels {channels}.")
+
+    def _subtract_background_channel(self, ch, sigma, multiplier, avg_imgs=False, clip=True, overwrite=False):
+        """
+        Subtract background for a single channel index `ch`. This method updates only that channel's data
+        and records parameters in `self.channels_df` without altering other channels' flags.
+        """
+        # Find a sample projection to infer num channels if needed
+        sample_proj = next((p for p in self.projections if p is not None), None)
+        if sample_proj is None:
+            raise ValueError(f"Channel {ch}: Projections are empty. Create projections first.")
+        num_channels = sample_proj.shape[0]
+        # Validate channel index
+        if ch < 0 or ch >= num_channels:
+            raise ValueError(f"Channel {ch}: index {ch} out of range for projections with {num_channels} channels.")
+
+        # Determine sigma if not provided. Respect multiplier=None as "no blur" intent
+        if sigma is None:
+            if multiplier is None:
+                if not avg_imgs:
+                    print(f"Channel {ch}: Neither sigma/multiplier given, and avg_imgs=False: No background subtraction to perform.")
+                    return
+                # no blur intended; keep sigma as None
+                print(f"Channel {ch}: No sigma and multiplier=None: proceeding without Gaussian blur (raw averages/subtraction).")
+            else:
+                if getattr(self, 'seg_diameter', None) is not None:
+                    sigma = max(1, int(round(self.seg_diameter * multiplier)))
+                    print(f"Channel {ch}: No sigma given: deriving sigma from seg_diameter={self.seg_diameter} -> sigma={sigma} (multiplier={multiplier})")
+                else:
+                    raise ValueError(f"Channel {ch}: sigma not provided and seg_diameter unknown. Provide sigma or run segmentation first to infer diameter.")
+
+        # Prepare channels_df if missing
+        if self.channels_df is None:
+            try:
+                proj_types = self.projections_types if self.projections_types is not None else [None] * num_channels
+            except Exception:
+                proj_types = [None] * num_channels
+            self.channels_df = pd.DataFrame({"projection": proj_types})
+
+        if len(self.channels_df) != num_channels:
+            self.channels_df = self.channels_df.reindex(range(num_channels)).reset_index(drop=True)
+
+        # Check existing bg flag for this channel
+        already = False
+        if 'bg_subtracted' in self.channels_df.columns:
+            try:
+                already = bool(self.channels_df.at[ch, 'bg_subtracted'])
+            except Exception:
+                already = False
+
+        # If already subtracted and not overwrite -> skip
+        if already and not overwrite:
+            print(f"Channel {ch}: Channel already background-subtracted and overwrite=False -> skipping channel {ch}.")
+            return
+
+        # If overwrite requested but originals missing -> fallback to non-overwrite behaviour
+        # (create originals now and proceed). This avoids a hard error when user
+        # passed overwrite=True but no prior bg-subtraction ran yet.
+        if overwrite and (not hasattr(self, 'projections_orig') or self.projections_orig is None):
+            print(f"Channel {ch}: Warning: overwrite=True requested but no originals found (probably no prior background subtraction); proceeding as with overwrite=False and saving originals now.")
+
+        # Create originals backup
+        if not hasattr(self, 'projections_orig') or self.projections_orig is None:
+            self.projections_orig = [np.copy(p) if p is not None else None for p in self.projections]
+            print(f"Channel {ch}: Original projections saved to `self.projections_orig`. You can revert by replacing `self.projections` with this list.")
+
+        # Use originals as "source" (fall back to current projections if originals missing for some reason)
+        source_projections = self.projections_orig if (hasattr(self, 'projections_orig') and self.projections_orig is not None) else self.projections
+
+        # If requested, compute a single averaged background image across all projections for this channel
+        background_plane = None
+        modified_count = 0
+        if avg_imgs:
+            planes = [p[ch].astype(np.float32) for p in source_projections if p is not None]
+            if len(planes) == 0:
+                print(f"Channel {ch}: No available projections for channel {ch} to compute average background; skipping channel.")
+                return
+            if sigma is None:
+                # no blur requested: average raw planes
+                background_plane = np.mean(planes, axis=0)
+                print(f"Channel {ch}: Using raw average background (no Gaussian blur).")
+            else:
+                # blur each plane then average
+                blurred_planes = [gaussian_filter(plane, sigma=sigma) for plane in planes]
+                background_plane = np.mean(blurred_planes, axis=0)
+                print(f"Channel {ch}: Using averaged blurred background (sigma={sigma}).")
+
+            # Subtract the single background from each image (using source_projections as source)
+            for i, src_proj in enumerate(source_projections):
+                if src_proj is None:
+                    continue
+                # Use the (unmodified) source projection plane for subtraction
+                orig_plane = src_proj[ch].astype(np.float32, copy=False)
+                corrected = orig_plane - background_plane
+                if clip:
+                    corrected = np.clip(corrected, 0, None)
+
+                # Prepare target projection: preserve any existing channels in self.projections if present,
+                # otherwise start from the source projection
+                if self.projections[i] is None:
+                    target_proj = np.copy(src_proj)
+                else:
+                    target_proj = np.copy(self.projections[i])
+
+                try:
+                    dtype = src_proj[ch].dtype
+                except Exception:
+                    dtype = src_proj.dtype
+                target_proj[ch] = corrected.astype(dtype, copy=False)
+                self.projections[i] = target_proj
+                modified_count += 1
+        else: # Do NOT average across images, but subtract per-image blurred background
+            # Apply subtraction per-image (existing behaviour)
+            for i, src_proj in enumerate(source_projections):
+                if src_proj is None:
+                    continue
+
+                # Use the unmodified source projection plane for computation
+                orig_plane = src_proj[ch].astype(np.float32, copy=False)
+                
+                if sigma is None: # Not possible, as we require sigma if not avg_imgs, but keep for safety:
+                    # no blur: subtract raw plane's mean (per-image behaviour: subtract image-specific mean)
+                    bg = np.mean(orig_plane)
+                    corrected = orig_plane - bg
+                else:
+                    # blur the source (unmodified) plane then subtract
+                    blurred = gaussian_filter(orig_plane, sigma=sigma)
+                    corrected = orig_plane - blurred
+                if clip:
+                    corrected = np.clip(corrected, 0, None)
+
+                # Prepare target projection: preserve existing channels if present, else start from source
+                if self.projections[i] is None:
+                    target_proj = np.copy(src_proj)
+                else:
+                    target_proj = np.copy(self.projections[i])
+
+                # Cast back to original dtype
+                try:
+                    dtype = src_proj[ch].dtype
+                except Exception:
+                    dtype = src_proj.dtype
+                target_proj[ch] = corrected.astype(dtype, copy=False)
+
+                # Save target back
+                self.projections[i] = target_proj
+                modified_count += 1
+
+        # Update channels_df only for this channel
+        if 'bg_subtracted' not in self.channels_df.columns:
+            self.channels_df['bg_subtracted'] = False
+        if 'bg_sigma' not in self.channels_df.columns:
+            self.channels_df['bg_sigma'] = pd.NA
+        if 'bg_avg' not in self.channels_df.columns:
+            self.channels_df['bg_avg'] = False
+
+        self.channels_df.at[ch, 'bg_subtracted'] = True
+        # record sigma only if a Gaussian was used
+        self.channels_df.at[ch, 'bg_sigma'] = sigma if sigma is not None else pd.NA
+        self.channels_df.at[ch, 'bg_avg'] = bool(avg_imgs)
+
+        # Report how many images were modified for visibility in partial-run cases
+        print(
+            f"Channel {ch}: Background subtraction applied to {modified_count} projections (avg_imgs={avg_imgs}, sigma={sigma}, overwrite={overwrite})."
+        )
     
     def directly_load_and_project(self, types=["max", "max", "max", "max"], c_axis=0, z_axis=1,
                                   num_imgs=None, overwrite=False):
@@ -576,6 +840,16 @@ class CellAnalyzer:
             self.projections = [None] * n_total
             self.projections_types = None
             self.samples_df["has_projection"] = False
+            # Clear any saved originals/provenance because projections are being replaced
+            # Initialize to a full-length None list so indexing mirrors `self.projections`
+            self.projections_orig = [None] * n_total
+            if self.channels_df is not None:
+                if 'bg_subtracted' in self.channels_df.columns:
+                    self.channels_df['bg_subtracted'] = False
+                if 'bg_sigma' in self.channels_df.columns:
+                    self.channels_df['bg_sigma'] = pd.NA
+                if 'bg_avg' in self.channels_df.columns:
+                    self.channels_df['bg_avg'] = False
         else:
             if self.projections_types is not None and self.projections_types != types:
                 raise ValueError(
@@ -586,6 +860,9 @@ class CellAnalyzer:
         # Initialize projection container if needed
         if self.projections is None:
             self.projections = [None] * n_total
+        # Ensure originals container exists and mirrors the projections list
+        if not hasattr(self, 'projections_orig') or self.projections_orig is None:
+            self.projections_orig = [None] * n_total
 
         # Keep tracking aligned with current projections
         self.samples_df["has_projection"] = [p is not None for p in self.projections]
@@ -641,6 +918,10 @@ class CellAnalyzer:
 
             self.projections[idx] = np.stack(img_projections, axis=c_axis)
             self.samples_df.at[idx, "has_projection"] = True
+
+            # Save original projection for this index if not already present
+            if self.projections_orig is not None and self.projections_orig[idx] is None:
+                self.projections_orig[idx] = np.copy(self.projections[idx])
 
             # Clean up to avoid keeping large arrays in memory
             try:
