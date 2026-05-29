@@ -615,11 +615,6 @@ class CellAnalyzer:
         Returns:
             None
         """
-        # Early exit if fractions is 0 (no subtraction intended, e.g. when looping for testing)
-        if bg_fraction == 0:
-            print("bg_fraction=0: No background subtraction to perform.")
-            return
-
         # Basic checks
         if self.projections is None:
             raise ValueError("Projections are empty. Create projections first.")
@@ -676,11 +671,6 @@ class CellAnalyzer:
         Subtract background for a single channel index `ch`. This method updates only that channel's data
         and records parameters in `self.channels_df` without altering other channels' flags.
         """
-        # Early exit if fractions is 0 (no subtraction intended, e.g. when looping for testing)
-        if bg_fraction == 0:
-            print("bg_fraction=0: No background subtraction to perform.")
-            return
-
         # Find a sample projection to infer num channels if needed
         sample_proj = next((p for p in self.projections if p is not None), None)
         if sample_proj is None:
