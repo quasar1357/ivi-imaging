@@ -640,8 +640,8 @@ class CellAnalyzer:
                     print("Neither sigma/multiplier given, and avg_imgs=False: No background subtraction to perform.")
                     return
                 # explicit request to skip Gaussian blur (sigma stays None)
-                print("No sigma and multiplier=None: proceeding without Gaussian blur (raw averages/subtraction).")
-            else:
+                print("No sigma and multiplier=None: proceeding without Gaussian blur (raw averages subtraction).")
+            else: # Use multiplier and cell diameter
                 if self.seg_diameter is not None:
                     sigma = max(1, int(round(self.seg_diameter * multiplier)))
                     print(f"No sigma given: deriving sigma from seg_diameter={self.seg_diameter} -> sigma={sigma} (multiplier={multiplier})")
@@ -681,15 +681,16 @@ class CellAnalyzer:
             raise ValueError(f"Channel {ch}: index {ch} out of range for projections with {num_channels} channels.")
 
         # Determine sigma if not provided. Respect multiplier=None as "no blur" intent
-        if sigma == 0: sigma = None # Treat sigma=0 as no-blur intent for user convenience, but keep sigma as None to avoid confusion in the code logic
+        if sigma == 0:
+            sigma = None # Treat sigma=0 as no-blur intent for user convenience, but keep sigma as None to avoid confusion in the code logic
         if sigma is None:
             if multiplier is None:
                 if not avg_imgs:
                     print(f"Channel {ch}: Neither sigma/multiplier given, and avg_imgs=False: No background subtraction to perform.")
                     return
                 # no blur intended; keep sigma as None
-                print(f"Channel {ch}: No sigma and multiplier=None: proceeding without Gaussian blur (raw averages/subtraction).")
-            else:
+                print(f"Channel {ch}: No sigma and multiplier=None: proceeding without Gaussian blur (raw averages subtraction).")
+            else: # Use multiplier and cell diameter
                 if getattr(self, 'seg_diameter', None) is not None:
                     sigma = max(1, int(round(self.seg_diameter * multiplier)))
                     print(f"Channel {ch}: No sigma given: deriving sigma from seg_diameter={self.seg_diameter} -> sigma={sigma} (multiplier={multiplier})")
