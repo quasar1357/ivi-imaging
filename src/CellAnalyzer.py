@@ -585,8 +585,9 @@ class CellAnalyzer:
         Behaviour & provenance:
         - This method operates on `self.projections` (assumed shape (C, H, W) per image).
         - Originals are saved in `self.projections_orig` the first time this method is called.
-          Callers can revert to originals by inspecting `self.projections_orig`.
-        - Parameters are stored in `self.channels_df` as columns `bg_subtracted` and `bg_sigma`
+          Callers can access originals in `self.projections_orig`; you can revert the bg-subtraction by replacing `self.projections` with this list.
+          Reverting to originals can also be achieved by re-running `create_projections()` or running the background subtraction method with `bg_fraction=0`.
+        - Parameters are stored in `self.channels_df` as columns `bg_subtracted` and `bg_sigma`, `bg_avg`, `bg_fraction` for each channel
 
         Parameters:
             channels : list of int or None
@@ -606,7 +607,7 @@ class CellAnalyzer:
             clip : bool
                 If True, negative values after subtraction are clipped to 0.
             overwrite : bool
-                If True, allows overwriting existing background-subtracted projections.
+                If True, allows overwriting existing background-subtracted projections. Repeated bg-subtraction is always applied to the original projections, stored in `self.projections_orig`.
                 If False, channels that are already marked as bg_subtracted in `self.channels_df` will be skipped to avoid accidental overwriting.
             allow_partial_projections : bool
                 If True, allows background subtraction on existing projections even if some images are missing projections (useful for quick testing), but issues a warning about potential inconsistencies.
