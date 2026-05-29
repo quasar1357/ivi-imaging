@@ -447,6 +447,8 @@ class CellAnalyzer:
                     self.channels_df['bg_sigma'] = pd.NA
                 if 'bg_avg' in self.channels_df.columns:
                     self.channels_df['bg_avg'] = False
+                if 'bg_fraction' in self.channels_df.columns:
+                    self.channels_df['bg_fraction'] = pd.NA
         else:
             if self.projections_types is not None and self.projections_types != types:
                 raise ValueError(
@@ -576,7 +578,7 @@ class CellAnalyzer:
 
         return self.projections
 
-    def subtract_background_on_projections(self, channels=None, sigma=None, multiplier=2, avg_imgs=False, clip=True, overwrite=False, allow_partial_projections=False):
+    def subtract_background_on_projections(self, channels=None, sigma=None, multiplier=2, avg_imgs=False, bg_fraction=1.0, clip=True, overwrite=False, allow_partial_projections=False):
         """
         Subtract a wide Gaussian-blurred background from the existing projections.
 
@@ -597,6 +599,10 @@ class CellAnalyzer:
                 Multiplier used when deriving sigma from `seg_diameter` (default 2).
             avg_imgs : bool
                 If True, computes a single average background image across all projections for each channel and subtracts that from each image.
+                If False, background subtraction is performed per-image (blur each image then subtract).
+            bg_fraction : float
+                Multiplier applied to the computed background before subtraction. Default `1.0` subtracts the full background.
+                Use values between 0 and 1 to subtract only a fraction of the background (e.g. `0.5`).
             clip : bool
                 If True, negative values after subtraction are clipped to 0.
             overwrite : bool
@@ -626,6 +632,8 @@ class CellAnalyzer:
                 print(f"Make sure to not mix background-subtracted with non-subtracted projections (or with subtraction using different parameters) in downstream analysis.")
 
         # Determine sigma. If `multiplier` is explicitly None we treat that as "no blur" intent
+        if sigma == 0:
+            sigma = None # Treat sigma=0 as no-blur intent for user convenience, but keep sigma as None to avoid confusion in the code logic
         if sigma is None:
             if multiplier is None:
                 if not avg_imgs: # Early exit if no blur intended and not averaging
@@ -654,11 +662,11 @@ class CellAnalyzer:
 
         # Call per-channel worker to avoid touching other channels' entries
         for ch in channels:
-            self._subtract_background_channel(ch=ch, sigma=sigma, multiplier=multiplier, avg_imgs=avg_imgs, overwrite=overwrite, clip=clip)
+            self._subtract_background_channel(ch=ch, sigma=sigma, multiplier=multiplier, avg_imgs=avg_imgs, bg_fraction=bg_fraction, overwrite=overwrite, clip=clip)
 
         print(f"Background subtraction completed for requested channels {channels}.")
 
-    def _subtract_background_channel(self, ch, sigma, multiplier, avg_imgs=False, clip=True, overwrite=False):
+    def _subtract_background_channel(self, ch, sigma, multiplier, avg_imgs=False, bg_fraction=1.0, clip=True, overwrite=False):
         """
         Subtract background for a single channel index `ch`. This method updates only that channel's data
         and records parameters in `self.channels_df` without altering other channels' flags.
@@ -673,6 +681,7 @@ class CellAnalyzer:
             raise ValueError(f"Channel {ch}: index {ch} out of range for projections with {num_channels} channels.")
 
         # Determine sigma if not provided. Respect multiplier=None as "no blur" intent
+        if sigma == 0: sigma = None # Treat sigma=0 as no-blur intent for user convenience, but keep sigma as None to avoid confusion in the code logic
         if sigma is None:
             if multiplier is None:
                 if not avg_imgs:
@@ -743,6 +752,11 @@ class CellAnalyzer:
                 blurred_planes = [gaussian_filter(plane, sigma=sigma) for plane in planes]
                 background_plane = np.mean(blurred_planes, axis=0)
                 print(f"Channel {ch}: Using averaged blurred background (sigma={sigma}).")
+            # Apply bg_fraction multiplier to the averaged background
+            try:
+                background_plane = background_plane * float(bg_fraction)
+            except Exception:
+                pass
 
             # Subtract the single background from each image (using source_projections as source)
             for i, src_proj in enumerate(source_projections):
@@ -780,12 +794,12 @@ class CellAnalyzer:
                 
                 if sigma is None: # Not possible, as we require sigma if not avg_imgs, but keep for safety:
                     # no blur: subtract raw plane's mean (per-image behaviour: subtract image-specific mean)
-                    bg = np.mean(orig_plane)
+                    bg = np.mean(orig_plane) * float(bg_fraction)
                     corrected = orig_plane - bg
                 else:
-                    # blur the source (unmodified) plane then subtract
+                    # blur the source (unmodified) plane then subtract (apply fraction)
                     blurred = gaussian_filter(orig_plane, sigma=sigma)
-                    corrected = orig_plane - blurred
+                    corrected = orig_plane - (blurred * float(bg_fraction))
                 if clip:
                     corrected = np.clip(corrected, 0, None)
 
@@ -814,6 +828,8 @@ class CellAnalyzer:
             self.channels_df['bg_sigma'] = pd.NA
         if 'bg_avg' not in self.channels_df.columns:
             self.channels_df['bg_avg'] = False
+        if 'bg_fraction' not in self.channels_df.columns:
+            self.channels_df['bg_fraction'] = pd.NA
 
         # Update per-channel projection stats for all modified images (reflect current self.projections)
         if modified_indices:
@@ -838,7 +854,10 @@ class CellAnalyzer:
         self.channels_df.at[ch, 'bg_subtracted'] = True
         # record sigma only if a Gaussian was used
         self.channels_df.at[ch, 'bg_sigma'] = sigma if sigma is not None else pd.NA
+        # record whether averaging was used (bool)
         self.channels_df.at[ch, 'bg_avg'] = bool(avg_imgs)
+        # record fraction applied to the background
+        self.channels_df.at[ch, 'bg_fraction'] = float(bg_fraction)
 
         # Report how many images were modified for visibility in partial-run cases
         print(
@@ -900,6 +919,8 @@ class CellAnalyzer:
                     self.channels_df['bg_sigma'] = pd.NA
                 if 'bg_avg' in self.channels_df.columns:
                     self.channels_df['bg_avg'] = False
+                if 'bg_fraction' in self.channels_df.columns:
+                    self.channels_df['bg_fraction'] = pd.NA
         else:
             if self.projections_types is not None and self.projections_types != types:
                 raise ValueError(
