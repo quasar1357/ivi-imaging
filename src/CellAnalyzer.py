@@ -25,6 +25,7 @@ class CellAnalyzer:
         self.img_arrays = None
         self.projections = None
         self.projections_types = None
+        self.z_slices = None
         self.projections_orig = None
         self.seg_channels = None
         self.seg_diameter = None
@@ -80,6 +81,7 @@ class CellAnalyzer:
             'samples_df': self.samples_df,
             'projections': self.projections,
             'projections_types': self.projections_types,
+            'z_slices': self.z_slices,
             'projections_orig': self.projections_orig,
             'seg_channels': self.seg_channels,
             'seg_diameter': self.seg_diameter,
@@ -198,6 +200,7 @@ class CellAnalyzer:
             self.img_arrays = None
             self.projections = None
             self.projections_types = None
+            self.z_slices = None
             self.projections_orig = None
             self.masks = None
             self.flows = None
@@ -370,7 +373,7 @@ class CellAnalyzer:
 
         return self.img_arrays
 
-    def create_projections(self, types=["max","max","max","max"], c_axis=0, z_axis=1, num_imgs=None, overwrite=False):
+    def create_projections(self, types=["max","max","max","max"], c_axis=0, z_axis=1, z_slices=None, num_imgs=None, overwrite=False):
         """
         Creates projections of all channels of the images in the image list.
         Skips images that already have a projection unless overwrite=True.
@@ -384,6 +387,8 @@ class CellAnalyzer:
                 The axis of the channels in the image arrays. Default is 0 (CZYX).
             z_axis : int
                 The axis of the z-dimension in the image arrays. Default is 1 (CZYX).
+            z_slices : list of tuples or None
+                For each channel, the slice along the z-axis to use for the projection. If None, the entire stacks are included for each channel.
             num_imgs : int
                 The maximum number of new projections to create. Default is None (all remaining images).
             overwrite : bool
@@ -426,17 +431,24 @@ class CellAnalyzer:
         num_channels = self.img_arrays[0].shape[c_axis]
         if len(types) != num_channels:
             raise ValueError(f"Number of types ({len(types)}) does not match number of channels ({num_channels}).")
+        if z_slices is None:
+            z_slices = [(None, None)] * num_channels
+        if len(z_slices) != num_channels:
+            raise ValueError(f"Number of z_slices ({len(z_slices)}) does not match number of channels ({num_channels}).")
 
         # Handle parameter consistency or reset projections (if overwrite=True)
         if overwrite:
             prev_proj = int(self.samples_df["has_projection"].sum()) if "has_projection" in self.samples_df.columns else 0
             if prev_proj > 0:
                 print(f"Using overwrite=True: resetting projections ({prev_proj}/{n_imgs_total} images had projections). Starting a new projection round.")
-            if self.projections_types is not None and self.projections_types != types:
-                print(f"You changed projection types from {self.projections_types} to {types}.")
+            new_types = self.projections_types is not None and self.projections_types != types
+            new_slices = self.z_slices is not None and self.z_slices != z_slices
+            if new_types or new_slices:
+                print(f"You changed projection types from {self.projections_types} to {types} and/or z_slices from {self.z_slices} to {z_slices}.")
                 print("\nWarning: if you have already performed downstream analysis, these might now be inconsistent with the new projections. Consider re-running those steps as well.")
             self.projections = [None] * n_imgs_total
             self.projections_types = None
+            self.z_slices = None
             self.samples_df["has_projection"] = False
             self.projections_orig = [None] * n_imgs_total
             # Clear any saved originals/provenance because projections are being replaced
@@ -454,6 +466,11 @@ class CellAnalyzer:
                 raise ValueError(
                     f"Projection types {types} differ from existing {self.projections_types}. "
                     "Use overwrite=True to replace all projections with the new types."
+                )
+            if self.z_slices is not None and self.z_slices != z_slices:
+                raise ValueError(
+                    f"z_slices {z_slices} differ from existing {self.z_slices}. "
+                    "Use overwrite=True to replace all projections with the new z_slices."
                 )
 
         # Initialize projection container if needed
@@ -516,10 +533,19 @@ class CellAnalyzer:
         for idx in pending:
             img = self.img_arrays[idx]
             img_projections = []
+
             for i in range(img.shape[c_axis]):
                 # Get the projection type for the current channel
                 proj_type = types[i]
+                # Extract the current channel
                 img_channel = np.take(img, indices=i, axis=c_axis)
+                # Apply z-slice if specified. Interpret (None, None) as full-range.
+                z_start, z_end = z_slices[i]
+                z_start = 0 if z_start is None else z_start
+                max_z = img_channel.shape[_z_axis]
+                z_end = max_z if (z_end is None or z_end > max_z) else z_end
+                img_channel = img_channel.take(indices=range(z_start, z_end), axis=_z_axis) # _z_axis accounts for removing the channel dimension
+                # Apply the specified projection
                 if proj_type == "max":
                     proj = np.max(img_channel, axis=_z_axis)
                 elif proj_type == "min":
@@ -540,8 +566,10 @@ class CellAnalyzer:
             self.projections[idx] = np.stack(img_projections, axis=c_axis)
             self.samples_df.at[idx, "has_projection"] = True
 
+            # Save original projection for this index if not already present
             if self.projections_orig is not None and self.projections_orig[idx] is None:
                 self.projections_orig[idx] = np.copy(self.projections[idx])
+
             # Compute per-channel min/max/mean and save as lists in samples_df
             try:
                 p = self.projections[idx]
@@ -559,14 +587,16 @@ class CellAnalyzer:
         n_done = int(self.samples_df["has_projection"].sum())
         print(f"{len(pending)} projection(s) created. Status after this run: {n_done}/{n_imgs_total}.")
 
-        # Save the projection types
+        # Save the projection types and z-slices in the object
         self.projections_types = types
+        self.z_slices = z_slices
 
-        # Save the projection types in channels_df
+        # Save the projection types and z-slices in channels_df
         if self.channels_df is None:
-            self.channels_df = pd.DataFrame({"projection": types})
+            self.channels_df = pd.DataFrame({"projection": types, "z_slices": z_slices})
         else:
             self.channels_df["projection"] = types
+            self.channels_df["z_slices"] = z_slices
 
         # Inform user if some images are not loaded into memory yet
         if n_loaded < n_imgs_total:
@@ -702,9 +732,11 @@ class CellAnalyzer:
         if self.channels_df is None:
             try:
                 proj_types = self.projections_types if self.projections_types is not None else [None] * num_channels
+                z_slices = self.z_slices if self.z_slices is not None else [(None, None)] * num_channels
             except Exception:
                 proj_types = [None] * num_channels
-            self.channels_df = pd.DataFrame({"projection": proj_types})
+                z_slices = [(None, None)] * num_channels
+            self.channels_df = pd.DataFrame({"projection": proj_types, "z_slices": z_slices})
 
         if len(self.channels_df) != num_channels:
             self.channels_df = self.channels_df.reindex(range(num_channels)).reset_index(drop=True)
@@ -866,7 +898,7 @@ class CellAnalyzer:
             f"Channel {ch}: Background subtraction applied to {modified_count} projections (sigma={sigma}, avg_imgs={avg_imgs})."
         )
     
-    def directly_load_and_project(self, types=["max", "max", "max", "max"], c_axis=0, z_axis=1,
+    def directly_load_and_project(self, types=["max", "max", "max", "max"], c_axis=0, z_axis=1, z_slices=None,
                                   num_imgs=None, overwrite=False):
         """
         Loads the images from the file paths in samples_df, directly creates projections and only saves those in the object.
@@ -880,6 +912,8 @@ class CellAnalyzer:
                 The axis of the channels in the image arrays. Default is 0 (CZYX).
             z_axis : int
                 The axis of the z-dimension in the image arrays. Default is 1 (CZYX).
+            z_slices : list of tuples or None
+                For each channel, the slice along the z-axis to use for the projection. If None, the entire stacks are included for each channel.
             num_imgs : int
                 The maximum number of images to load. Default is None (all remaining images).
             overwrite : bool
@@ -905,11 +939,14 @@ class CellAnalyzer:
             prev_proj = int(self.samples_df["has_projection"].sum()) if "has_projection" in self.samples_df.columns else 0
             if prev_proj > 0:
                 print(f"Using overwrite=True: resetting projections ({prev_proj}/{n_total} images had projections). Starting a new projection round.")
-            if self.projections_types is not None and self.projections_types != types:
-                print(f"You changed projection types from {self.projections_types} to {types}.")
+            new_types = self.projections_types is not None and self.projections_types != types
+            new_slices = self.z_slices is not None and self.z_slices != z_slices
+            if new_types or new_slices:
+                print(f"You changed projection types from {self.projections_types} to {types} and/or z_slices from {self.z_slices} to {z_slices}.")
                 print("\nWarning: if you have already performed downstream analysis, these might now be inconsistent with the new projections. Consider re-running those steps as well.")
             self.projections = [None] * n_total
             self.projections_types = None
+            self.z_slices = None
             self.samples_df["has_projection"] = False
             # Clear any saved originals/provenance because projections are being replaced
             # Initialize to a full-length None list so indexing mirrors `self.projections`
@@ -928,6 +965,11 @@ class CellAnalyzer:
                 raise ValueError(
                     f"Projection types {types} differ from existing {self.projections_types}. "
                     "Use overwrite=True to replace all projections with the new types."
+                )
+            if self.z_slices is not None and self.z_slices != z_slices:
+                raise ValueError(
+                    f"z_slices {z_slices} differ from existing {self.z_slices}. "
+                    "Use overwrite=True to replace all projections with the new z_slices."
                 )
 
         # Initialize projection container if needed
@@ -981,10 +1023,29 @@ class CellAnalyzer:
             img_in = AICSImage(self.samples_df.at[idx, "filepath"])
             img = img_in.get_image_data("CZYX", T=0)
             img_projections = []
-            for i in range(img.shape[c_axis]):
+
+            # Test number channels
+            if idx == 0: # Infer num channels and validate types/z_slices after loading the first image
+                num_channels = img.shape[c_axis]
+                if len(types) != num_channels:
+                    raise ValueError(f"Number of types ({len(types)}) does not match number of channels ({num_channels}) in image {idx}.")
+                if z_slices is None:
+                    z_slices = [(None, None)] * num_channels
+                if len(z_slices) != num_channels:
+                    raise ValueError(f"Number of z_slices ({len(z_slices)}) does not match number of channels ({num_channels}).")
+
+            for i in range(num_channels):
                 # Get the projection type for the current channel
                 proj_type = types[i]
+                # Extract the current channel
                 img_channel = np.take(img, indices=i, axis=c_axis)
+                # Apply z-slice if specified. Interpret (None, None) as full-range.
+                z_start, z_end = z_slices[i]
+                z_start = 0 if z_start is None else z_start
+                max_z = img_channel.shape[_z_axis]
+                z_end = max_z if (z_end is None or z_end > max_z) else z_end
+                img_channel = img_channel.take(indices=range(z_start, z_end), axis=_z_axis) # _z_axis accounts for removing the channel dimension
+                # Apply the specified projection
                 if proj_type == "max":
                     proj = np.max(img_channel, axis=_z_axis)
                 elif proj_type == "min":
@@ -1032,14 +1093,16 @@ class CellAnalyzer:
         n_projected_after = int(self.samples_df["has_projection"].sum())
         print(f"{len(pending)} image(s) projected. Status after this run: {n_projected_after}/{n_total}.")
 
-        # Save projection types
+        # Save the projection types and z-slices in the object
         self.projections_types = types
+        self.z_slices = z_slices
 
-        # Save the projection types in channels_df
+        # Save the projection types and z-slices in channels_df
         if self.channels_df is None:
-            self.channels_df = pd.DataFrame({"projection": types})
+            self.channels_df = pd.DataFrame({"projection": types, "z_slices": z_slices})
         else:
             self.channels_df["projection"] = types
+            self.channels_df["z_slices"] = z_slices
 
         return self.projections
 
