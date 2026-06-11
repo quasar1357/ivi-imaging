@@ -539,8 +539,8 @@ class CellAnalyzer:
                 proj_type = types[i]
                 # Extract the current channel
                 img_channel = np.take(img, indices=i, axis=c_axis)
-                # Apply z-slice if specified. Interpret (None, None) as full-range.
-                z_start, z_end = z_slices[i]
+                # Apply z-slice if specified. Interpret None for a channel as (None, None).
+                z_start, z_end = (None, None) if z_slices[i] is None else z_slices[i]
                 max_z = img_channel.shape[_z_axis]
                 # Default None to full-range, convert to ints
                 z_start = 0 if z_start is None else int(z_start)
@@ -1049,8 +1049,8 @@ class CellAnalyzer:
                 proj_type = types[i]
                 # Extract the current channel
                 img_channel = np.take(img, indices=i, axis=c_axis)
-                # Apply z-slice if specified. Interpret (None, None) as full-range.
-                z_start, z_end = z_slices[i]
+                # Apply z-slice if specified. Interpret None for a channel as (None, None).
+                z_start, z_end = (None, None) if z_slices[i] is None else z_slices[i]
                 max_z = img_channel.shape[_z_axis]
                 # Default None to full-range, convert to ints
                 z_start = 0 if z_start is None else int(z_start)
