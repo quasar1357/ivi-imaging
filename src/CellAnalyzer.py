@@ -541,9 +541,19 @@ class CellAnalyzer:
                 img_channel = np.take(img, indices=i, axis=c_axis)
                 # Apply z-slice if specified. Interpret (None, None) as full-range.
                 z_start, z_end = z_slices[i]
-                z_start = 0 if z_start is None else z_start
                 max_z = img_channel.shape[_z_axis]
-                z_end = max_z if (z_end is None or z_end > max_z) else z_end
+                # Default None to full-range, convert to ints
+                z_start = 0 if z_start is None else int(z_start)
+                z_end = max_z if z_end is None else int(z_end)
+                # Minimal normalization for negative indices: map to positive relative to max_z
+                if z_start < 0:
+                    z_start = max(z_start + max_z, 0)
+                if z_end < 0:
+                    z_end = max(z_end + max_z, 0)
+                z_end = min(max_z, z_end)
+                if z_start >= z_end:
+                    raise ValueError(f"Invalid z-slice ({z_start}:{z_end}) for channel {i} in image {idx} with size {max_z} along z-axis.")
+                # Apply z-slice
                 img_channel = img_channel.take(indices=range(z_start, z_end), axis=_z_axis) # _z_axis accounts for removing the channel dimension
                 # Apply the specified projection
                 if proj_type == "max":
@@ -1041,9 +1051,19 @@ class CellAnalyzer:
                 img_channel = np.take(img, indices=i, axis=c_axis)
                 # Apply z-slice if specified. Interpret (None, None) as full-range.
                 z_start, z_end = z_slices[i]
-                z_start = 0 if z_start is None else z_start
                 max_z = img_channel.shape[_z_axis]
-                z_end = max_z if (z_end is None or z_end > max_z) else z_end
+                # Default None to full-range, convert to ints
+                z_start = 0 if z_start is None else int(z_start)
+                z_end = max_z if z_end is None else int(z_end)
+                # Minimal normalization for negative indices: map to positive relative to max_z
+                if z_start < 0:
+                    z_start = max(z_start + max_z, 0)
+                if z_end < 0:
+                    z_end = max(z_end + max_z, 0)
+                z_end = min(max_z, z_end)
+                if z_start >= z_end:
+                    raise ValueError(f"Invalid z-slice ({z_start}:{z_end}) for channel {i} in image {idx} with size {max_z} along z-axis.")
+                # Apply z-slice
                 img_channel = img_channel.take(indices=range(z_start, z_end), axis=_z_axis) # _z_axis accounts for removing the channel dimension
                 # Apply the specified projection
                 if proj_type == "max":
