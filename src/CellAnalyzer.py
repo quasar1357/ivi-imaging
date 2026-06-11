@@ -389,6 +389,8 @@ class CellAnalyzer:
                 The axis of the z-dimension in the image arrays. Default is 1 (CZYX).
             z_slices : list of tuples or None
                 For each channel, the slice along the z-axis to use for the projection. If None, the entire stacks are included for each channel.
+                Indices are 0-indexed and exclusive at the end. Negative values are allowed (counting from end). None is interpreted as the full range until start/end.
+                Example: [None, (0,5), (-10, None)] means: full range for channel 1, first 5 slices for channel 2, and last 10 slices for channel 3.
             num_imgs : int
                 The maximum number of new projections to create. Default is None (all remaining images).
             overwrite : bool
@@ -924,6 +926,8 @@ class CellAnalyzer:
                 The axis of the z-dimension in the image arrays. Default is 1 (CZYX).
             z_slices : list of tuples or None
                 For each channel, the slice along the z-axis to use for the projection. If None, the entire stacks are included for each channel.
+                Indices are 0-indexed and exclusive at the end. Negative values are allowed (counting from end). None is interpreted as the full range until start/end.
+                Example: [None, (0,5), (-10, None)] means: full range for channel 1, first 5 slices for channel 2, and last 10 slices for channel 3.
             num_imgs : int
                 The maximum number of images to load. Default is None (all remaining images).
             overwrite : bool
